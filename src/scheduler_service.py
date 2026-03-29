@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import datetime
 from datetime import timedelta
 from threading import Event, Thread
@@ -9,11 +10,6 @@ from src.storage import Storage
 
 
 class SchedulerService:
-    RETRY_COOLDOWN_MINUTES = 5
-    AUTO_FAILURE_COOLDOWN_MINUTES = 3
-    DUPLICATE_GUARD_SECONDS = 90
-    ENABLE_OFFLINE_RETRY = False
-
     def __init__(
         self,
         storage: Storage,
@@ -44,15 +40,18 @@ class SchedulerService:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            cfg: AppConfig = self.get_config()
+            interval = max(1, int(cfg.scheduler_poll_interval_seconds))
             try:
-                if self.ENABLE_OFFLINE_RETRY:
+                if cfg.enable_offline_retry:
                     self._flush_offline_queue()
                 self._run_due_events()
             except Exception as exc:  # noqa: BLE001
                 self.on_log("ERROR", "Erro no agendador.", {"error": str(exc)})
-            sleep(20)
+            sleep(interval)
 
     def _flush_offline_queue(self) -> None:
+        cfg: AppConfig = self.get_config()
         state = self.storage.load_runtime_state()
         queue = state.get("offline_queue", [])
         if not queue:
@@ -64,7 +63,7 @@ class SchedulerService:
         remaining = []
         now = datetime.now()
         for item in queue:
-            if not self._can_attempt_new_punch(state, now):
+            if not self._can_attempt_new_punch(state, now, cfg):
                 remaining.append(item)
                 continue
             next_retry_raw = item.get("next_retry_at")
@@ -78,7 +77,10 @@ class SchedulerService:
                     pass
 
             _ = datetime.fromisoformat(item["timestamp"])
-            ok, msg = client.register_punch(item["punch_type"])
+            ok, msg = client.register_punch(
+                item["punch_type"],
+                on_step=lambda m: self.on_log("INFO", f"Robô (reenvio): {m}"),
+            )
             if ok:
                 self._mark_last_successful_punch(state, now)
                 self.on_log("INFO", "Reenvio offline realizado.", item)
@@ -90,7 +92,7 @@ class SchedulerService:
                 )
             else:
                 retries = int(item.get("retries", 0)) + 1
-                next_retry_at = now + timedelta(minutes=self.RETRY_COOLDOWN_MINUTES)
+                next_retry_at = now + timedelta(minutes=cfg.retry_cooldown_minutes)
                 item["retries"] = retries
                 item["next_retry_at"] = next_retry_at.isoformat(timespec="seconds")
                 remaining.append(item)
@@ -125,7 +127,7 @@ class SchedulerService:
                 if failed_at:
                     try:
                         last_fail = datetime.fromisoformat(failed_at)
-                        if now < last_fail + timedelta(minutes=self.AUTO_FAILURE_COOLDOWN_MINUTES):
+                        if now < last_fail + timedelta(minutes=cfg.auto_failure_cooldown_minutes):
                             continue
                     except ValueError:
                         pass
@@ -137,7 +139,8 @@ class SchedulerService:
                     continue
                 now_minutes = now.hour * 60 + now.minute
                 if abs(now_minutes - target_minutes) <= tolerance:
-                    success, _ = self._execute_punch(ev.punch_type, source="auto")
+                    custom = (ev.description or "").strip() or None
+                    success, _ = self._execute_punch(ev.punch_type, source="auto", custom_reason=custom)
                     if success:
                         executions[key] = now.isoformat()
                         failed_attempts.pop(key, None)
@@ -152,19 +155,28 @@ class SchedulerService:
         punch_type: str,
         source: str,
         custom_reason: str | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> tuple[bool, str]:
         cfg: AppConfig = self.get_config()
         client: MyworkApiClient = self.get_api_client()
         now = datetime.now()
         state = self.storage.load_runtime_state()
-        if not self._can_attempt_new_punch(state, now):
+        if not self._can_attempt_new_punch(state, now, cfg):
+            sec = int(cfg.duplicate_guard_seconds)
             msg = (
                 "Bloqueado para evitar duplicidade: já houve registro recente. "
-                f"Aguarde {self.DUPLICATE_GUARD_SECONDS}s."
+                f"Aguarde {sec}s."
             )
             self.on_log("WARN", "Registro bloqueado por proteção de duplicidade.", {"source": source})
             return False, msg
-        ok, msg = client.register_punch(punch_type, custom_reason=custom_reason)
+        step_cb: Callable[[str], None] | None
+        if on_step is not None:
+            step_cb = on_step
+        elif source == "auto":
+            step_cb = lambda m: self.on_log("INFO", f"Robô (agendado): {m}")
+        else:
+            step_cb = None
+        ok, msg = client.register_punch(punch_type, custom_reason=custom_reason, on_step=step_cb)
         if ok:
             self._mark_last_successful_punch(state, now)
             self.storage.save_runtime_state(state)
@@ -185,14 +197,23 @@ class SchedulerService:
             success=False,
             message=msg,
         )
-        # Em automação web, retry automático pode gerar marcações indevidas.
         state["offline_queue"] = []
         self.storage.save_runtime_state(state)
         self.on_notify(f"Falha no registro ({punch_type}). Sem retry automático.")
         return False, msg
 
-    def manual_punch(self, punch_type: str, custom_reason: str | None = None) -> tuple[bool, str]:
-        return self._execute_punch(punch_type, source="manual", custom_reason=custom_reason)
+    def manual_punch(
+        self,
+        punch_type: str,
+        custom_reason: str | None = None,
+        on_step: Callable[[str], None] | None = None,
+    ) -> tuple[bool, str]:
+        return self._execute_punch(
+            punch_type,
+            source="manual",
+            custom_reason=custom_reason,
+            on_step=on_step,
+        )
 
     def _append_history(self, punch_type: str, source: str, success: bool, message: str) -> None:
         self.storage.append_history(
@@ -205,7 +226,7 @@ class SchedulerService:
             }
         )
 
-    def _can_attempt_new_punch(self, state: dict, now: datetime) -> bool:
+    def _can_attempt_new_punch(self, state: dict, now: datetime, cfg: AppConfig) -> bool:
         last_success = state.get("last_successful_punch_at")
         if not last_success:
             return True
@@ -213,7 +234,7 @@ class SchedulerService:
             last_dt = datetime.fromisoformat(last_success)
         except ValueError:
             return True
-        return (now - last_dt).total_seconds() >= self.DUPLICATE_GUARD_SECONDS
+        return (now - last_dt).total_seconds() >= int(cfg.duplicate_guard_seconds)
 
     def _mark_last_successful_punch(self, state: dict, when: datetime) -> None:
         state["last_successful_punch_at"] = when.isoformat(timespec="seconds")

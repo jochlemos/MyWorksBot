@@ -1,8 +1,13 @@
+import time
+
+from collections.abc import Callable
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from src.models import AppConfig
+
+RobotStepCallback = Callable[[str], None] | None
 
 
 class MyworkApiClient:
@@ -10,6 +15,48 @@ class MyworkApiClient:
         self.config = config
         self.email = email.strip()
         self.password = password
+
+    @staticmethod
+    def _step(on_step: RobotStepCallback, message: str) -> None:
+        if on_step:
+            try:
+                on_step(message)
+            except Exception:
+                pass
+
+    def _nav_timeout(self) -> int:
+        return max(1000, int(self.config.playwright_navigation_timeout_ms))
+
+    def _field_timeout(self) -> int:
+        return max(1000, int(self.config.playwright_field_timeout_ms))
+
+    def _email_selectors(self) -> list[str]:
+        return self._unique_selectors(
+            [self.config.email_selector, *self.config.selector_fallback_email]
+        )
+
+    def _password_selectors(self) -> list[str]:
+        return self._unique_selectors(
+            [self.config.password_selector, *self.config.selector_fallback_password]
+        )
+
+    def _submit_selectors(self) -> list[str]:
+        return self._unique_selectors(
+            [self.config.submit_selector, *self.config.selector_fallback_submit]
+        )
+
+    def _apply_post_run_pause(self, page, on_step: RobotStepCallback) -> None:
+        if self.config.headless_browser:
+            return
+        cap = max(0, int(self.config.browser_pause_max_seconds))
+        sec = max(0, min(cap, int(self.config.browser_pause_seconds or 0)))
+        if sec <= 0:
+            return
+        self._step(
+            on_step,
+            f"Navegador visível: aguardando {sec}s antes de fechar (ajuste em Configuração).",
+        )
+        page.wait_for_timeout(sec * 1000)
 
     def is_configured(self) -> bool:
         return bool(
@@ -23,47 +70,74 @@ class MyworkApiClient:
             and self.config.punch_button_selector
         )
 
-    def register_punch(self, punch_type: str, custom_reason: str | None = None) -> tuple[bool, str]:
+    def register_punch(
+        self,
+        punch_type: str,
+        custom_reason: str | None = None,
+        on_step: RobotStepCallback = None,
+    ) -> tuple[bool, str]:
         if not self.is_configured():
             return False, "Robô não configurado (credenciais/URLs/seletores)."
+        punch_to = max(1000, int(self.config.playwright_punch_click_timeout_ms))
+        hist_to = max(1000, int(self.config.playwright_history_wait_timeout_ms))
+        post_login = max(0, int(self.config.playwright_post_login_stabilize_ms))
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=self.config.headless_browser)
+                self._step(on_step, "Iniciando motor do navegador (Playwright).")
+                headless = self.config.headless_browser
+                self._step(
+                    on_step,
+                    "Modo do navegador: oculto (headless)."
+                    if headless
+                    else "Modo do navegador: janela visível.",
+                )
+                browser = p.chromium.launch(headless=headless)
+                self._step(on_step, "Navegador aberto; criando nova aba.")
                 page = browser.new_page()
-                self._perform_login(page)
-                page.wait_for_timeout(2500)
-                self._ensure_on_punch_page(page)
+                self._perform_login(page, on_step)
+                self._step(on_step, "Estabilizando sessão após login.")
+                if post_login:
+                    page.wait_for_timeout(post_login)
+                self._ensure_on_punch_page(page, on_step)
                 reason_text = (custom_reason or "").strip() or self._reason_text_for_punch(punch_type)
+                self._step(on_step, "Verificando regras de descrição e histórico.")
                 if self.config.prevent_same_description:
                     latest_comment = self._get_latest_history_comment(page)
-                    if latest_comment and self._normalize_text(latest_comment) == self._normalize_text(reason_text):
+                    if latest_comment and self._normalize_text(latest_comment) == self._normalize_text(
+                        reason_text
+                    ):
+                        self._apply_post_run_pause(page, on_step)
                         browser.close()
                         return (
                             False,
                             "Bloqueado: a última descrição no histórico é igual à nova descrição.",
                         )
                 marker_before = self._get_history_marker(page)
+                self._step(on_step, f"Clicando no tipo de batida: {punch_type}.")
                 try:
                     self._click_first(
                         page,
                         self._selectors_for_punch(punch_type),
-                        timeout_ms=15000,
+                        timeout_ms=punch_to,
                     )
                 except RuntimeError:
+                    self._step(on_step, "Tentando abrir área de ponto pelo menu.")
                     self._try_open_punch_area(page)
                     self._click_first(
                         page,
                         self._selectors_for_punch(punch_type),
-                        timeout_ms=15000,
+                        timeout_ms=punch_to,
                     )
+                self._step(on_step, "Preenchendo motivo / modal (se aparecer).")
                 self._handle_reason_modal(page, punch_type, custom_reason=reason_text)
-                if not self._wait_for_history_change(page, marker_before, timeout_ms=20000):
-                    # O Mywork pode demorar para refletir na tabela; se não houver erro visível,
-                    # consideramos a ação como aceita para evitar falso negativo.
+                self._step(on_step, "Aguardando confirmação no histórico de pontos.")
+                if not self._wait_for_history_change(page, marker_before, timeout_ms=hist_to):
                     if self._has_visible_error_feedback(page):
                         raise RuntimeError(
                             "Clique executado, mas a tela exibiu erro de validação/confirmação."
                         )
+                self._apply_post_run_pause(page, on_step)
+                self._step(on_step, "Encerrando navegador.")
                 browser.close()
                 return True, f"Ponto {punch_type} executado pelo robô."
         except PlaywrightTimeoutError as exc:
@@ -73,101 +147,194 @@ class MyworkApiClient:
         except Exception as exc:  # noqa: BLE001
             return False, f"Erro inesperado: {exc}"
 
-    def test_connection(self) -> tuple[bool, str]:
+    def test_connection(self, on_step: RobotStepCallback = None) -> tuple[bool, str]:
         if not self.is_configured():
             return False, "Configure credenciais e seletores primeiro."
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
+                headless = self.config.headless_browser
+                self._step(
+                    on_step,
+                    "Teste: navegador em modo oculto."
+                    if headless
+                    else "Teste: navegador com janela visível.",
+                )
+                browser = p.chromium.launch(headless=headless)
                 page = browser.new_page()
-                self._perform_login(page)
-                self._ensure_on_punch_page(page)
-                page.wait_for_timeout(3000)
+                self._perform_login(page, on_step)
+                self._ensure_on_punch_page(page, on_step)
+                self._apply_post_run_pause(page, on_step)
+                self._step(on_step, "Teste: fechando navegador.")
                 browser.close()
             return True, "Login automatizado executado."
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
 
-    def _perform_login(self, page) -> None:
-        page.goto(self.config.login_url, wait_until="domcontentloaded", timeout=30000)
+    def _perform_login(self, page, on_step: RobotStepCallback = None) -> None:
+        nav_to = self._nav_timeout()
+        field_to = self._field_timeout()
+        self._step(on_step, "Abrindo URL de login.")
+        page.goto(self.config.login_url, wait_until="domcontentloaded", timeout=nav_to)
+        self._step(on_step, "Preenchendo e-mail.")
         self._fill_first(
             page,
-            [
-                self.config.email_selector,
-                "input[type='email']",
-                "input[name='email']",
-                "input[name='username']",
-                "input[name='login']",
-                "input[id*='email']",
-                "input[id*='user']",
-                "input[type='text']",
-            ],
+            self._email_selectors(),
             value=self.email,
-            timeout_ms=12000,
+            timeout_ms=field_to,
             field_name="usuário/e-mail",
         )
+        self._step(on_step, "Preenchendo senha.")
         self._fill_first(
             page,
-            [
-                self.config.password_selector,
-                "input[type='password']",
-                "input[name='password']",
-                "input[id*='pass']",
-            ],
+            self._password_selectors(),
             value=self.password,
-            timeout_ms=12000,
+            timeout_ms=field_to,
             field_name="senha",
         )
+        pre_submit_url = (page.url or "").strip()
+        self._step(on_step, "Enviando formulário de login.")
         self._click_first(
             page,
-            [
-                self.config.submit_selector,
-                "button[type='submit']",
-                "button:has-text('Entrar')",
-                "button:has-text('Login')",
-                "input[type='submit']",
-            ],
-            timeout_ms=12000,
+            self._submit_selectors(),
+            timeout_ms=field_to,
         )
+        self._step(on_step, "Aguardando confirmação do login (sessão).")
+        self._wait_for_login_success(page, pre_submit_url)
+        self._step(on_step, "Login confirmado.")
+
+    def _login_error_visible(self, page) -> bool:
+        selectors = self.config.login_error_selectors
+        for selector in selectors:
+            for ctx in self._iter_contexts(page):
+                try:
+                    loc = ctx.locator(selector).first
+                    if loc.count() > 0 and loc.is_visible():
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _still_on_login_form(self, page) -> bool:
+        pwd_sel = (self.config.still_on_login_password_selector or "").strip()
+        if not pwd_sel:
+            return False
+        subs = self.config.still_on_login_submit_selectors
+        sub_joined = ", ".join(subs) if subs else ""
+        try:
+            for ctx in self._iter_contexts(page):
+                pwd = ctx.locator(pwd_sel).first
+                if pwd.count() == 0:
+                    continue
+                if not sub_joined:
+                    return True
+                sub = ctx.locator(sub_joined).first
+                if sub.count() > 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _has_logged_in_ui(self, page) -> bool:
+        if self._is_punch_context(page):
+            return True
+        for selector in self.config.logged_in_ui_markers:
+            for ctx in self._iter_contexts(page):
+                try:
+                    loc = ctx.locator(selector).first
+                    if loc.count() > 0 and loc.is_visible():
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _wait_for_login_success(self, page, pre_submit_url: str, timeout_ms: int | None = None) -> None:
+        if timeout_ms is None:
+            timeout_ms = max(1000, int(self.config.playwright_login_wait_timeout_ms))
+        poll = max(50, int(self.config.playwright_login_poll_ms))
+        trans = max(50, int(self.config.playwright_login_transition_ms))
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        pre = (pre_submit_url or "").strip()
+        while time.monotonic() < deadline:
+            if self._login_error_visible(page):
+                raise RuntimeError(
+                    "Falha no login: mensagem de erro na tela ou credenciais inválidas."
+                )
+            if self._is_punch_context(page):
+                return
+            if self._has_logged_in_ui(page):
+                return
+            cur = (page.url or "").strip()
+            if cur != pre:
+                low = cur.lower()
+                path_markers = self.config.login_wait_redirect_path_substrings
+                if path_markers and any((m and m.lower() in low) for m in path_markers):
+                    page.wait_for_timeout(poll)
+                    continue
+                oauth_markers = self.config.login_wait_oauth_substring_markers
+                if oauth_markers and all((m and m.lower() in low) for m in oauth_markers):
+                    page.wait_for_timeout(poll)
+                    continue
+                return
+            if not self._still_on_login_form(page):
+                page.wait_for_timeout(trans)
+                if not self._still_on_login_form(page) and self._has_logged_in_ui(page):
+                    return
+                if not self._still_on_login_form(page) and self._is_punch_context(page):
+                    return
+            page.wait_for_timeout(poll)
+
+        if self._login_error_visible(page):
+            raise RuntimeError("Falha no login: verifique usuário e senha.")
+        if self._has_logged_in_ui(page) or self._is_punch_context(page):
+            return
+        if self._still_on_login_form(page):
+            raise RuntimeError(
+                f"Login não foi concluído no tempo esperado (sessão não detectada). URL: {page.url}"
+            )
+        raise RuntimeError(f"Não foi possível confirmar o login. URL: {page.url}")
 
     def _effective_punch_url(self) -> str:
         configured = (self.config.punch_page_url or "").strip()
         if not configured:
-            return "https://app.mywork.com.br/ponto"
+            return ""
         lowered = configured.rstrip("/").lower()
-        if lowered in {"https://app.mywork.com.br", "https://app.mywork.com.br/"}:
-            return "https://app.mywork.com.br/ponto"
+        redirects = self.config.punch_page_url_redirects or {}
+        for key, target in redirects.items():
+            k = (key or "").strip().rstrip("/").lower()
+            if k and k == lowered:
+                return (target or "").strip()
         return configured
 
-    def _ensure_on_punch_page(self, page) -> None:
+    def _ensure_on_punch_page(self, page, on_step: RobotStepCallback = None) -> None:
+        nav_to = self._nav_timeout()
         target = self._effective_punch_url()
-        page.goto(target, wait_until="domcontentloaded", timeout=30000)
+        if not target:
+            raise RuntimeError("URL da página de ponto não configurada.")
+        self._step(on_step, f"Carregando página de ponto ({target}).")
+        page.goto(target, wait_until="domcontentloaded", timeout=nav_to)
         if self._is_punch_context(page):
+            self._step(on_step, "Página de ponto detectada.")
             return
 
-        # Fallback para navegação por menu em layouts SPA.
+        self._step(on_step, "Procurando atalho para Ponto no menu.")
         self._try_open_punch_area(page)
         if self._is_punch_context(page):
+            self._step(on_step, "Página de ponto aberta pelo menu.")
             return
 
-        # Segunda tentativa com espera de rede ociosa.
-        page.goto(target, wait_until="networkidle", timeout=30000)
+        self._step(on_step, "Segunda tentativa de carregamento (rede).")
+        page.goto(target, wait_until="networkidle", timeout=nav_to)
         if self._is_punch_context(page):
+            self._step(on_step, "Página de ponto carregada (2ª tentativa).")
             return
         raise RuntimeError(f"Não foi possível abrir a página de ponto. URL atual: {page.url}")
 
     def _is_punch_context(self, page) -> bool:
         current_url = (page.url or "").lower()
-        if "/ponto" in current_url:
-            return True
-        indicators = [
-            "text='Bater ponto'",
-            "text='Bater seu ponto'",
-            "text='Histórico de pontos'",
-            "h1:has-text('Ponto')",
-            "h2:has-text('Ponto')",
-        ]
-        for selector in indicators:
+        for sub in self.config.punch_context_url_substrings:
+            if sub and sub.lower() in current_url:
+                return True
+        for selector in self.config.punch_context_indicators:
             for ctx in self._iter_contexts(page):
                 try:
                     locator = ctx.locator(selector).first
@@ -281,12 +448,7 @@ class MyworkApiClient:
         return "; ".join(snippets[:8])
 
     def _get_history_marker(self, page) -> str:
-        selectors = [
-            "table tbody tr:first-child td:first-child",
-            ".table tbody tr:first-child td:first-child",
-            "tbody tr:first-child td:first-child",
-        ]
-        for selector in selectors:
+        for selector in self.config.history_marker_selectors:
             for ctx in self._iter_contexts(page):
                 try:
                     cell = ctx.locator(selector).first
@@ -300,12 +462,7 @@ class MyworkApiClient:
         return ""
 
     def _get_latest_history_comment(self, page) -> str:
-        selectors = [
-            "table tbody tr:first-child td:nth-child(6)",
-            ".table tbody tr:first-child td:nth-child(6)",
-            "tbody tr:first-child td:nth-child(6)",
-        ]
-        for selector in selectors:
+        for selector in self.config.history_comment_cell_selectors:
             for ctx in self._iter_contexts(page):
                 try:
                     cell = ctx.locator(selector).first
@@ -320,7 +477,7 @@ class MyworkApiClient:
 
     def _wait_for_history_change(self, page, marker_before: str, timeout_ms: int) -> bool:
         elapsed = 0
-        step = 1000
+        step = max(200, int(self.config.playwright_history_poll_step_ms))
         while elapsed < timeout_ms:
             page.wait_for_timeout(step)
             marker_after = self._get_history_marker(page)
@@ -333,47 +490,26 @@ class MyworkApiClient:
         reason_text = (custom_reason or "").strip() or self._reason_text_for_punch(punch_type)
         if not self._is_reason_modal_visible(page):
             return
-        reason_fields = [
-            "textarea",
-            "input[placeholder*='Coment' i]",
-            "input[placeholder*='coment' i]",
-            "input[placeholder*='ponto' i]",
-            "textarea[name*='motivo' i]",
-            "textarea[id*='motivo' i]",
-            "textarea[name*='comment' i]",
-            "textarea[id*='comment' i]",
-            "input[name*='motivo' i]",
-            "input[id*='motivo' i]",
-            "input[name*='comment' i]",
-            "input[id*='comment' i]",
-        ]
+        fill_to = max(500, int(self.config.playwright_reason_modal_fill_timeout_ms))
+        confirm_to = max(500, int(self.config.playwright_reason_modal_confirm_timeout_ms))
+        after_to = max(0, int(self.config.playwright_reason_modal_after_click_ms))
         try:
-            self._fill_first(page, reason_fields, reason_text, timeout_ms=3000, field_name="motivo")
+            self._fill_first(
+                page,
+                self.config.reason_modal_fields,
+                reason_text,
+                timeout_ms=fill_to,
+                field_name="motivo",
+            )
         except Exception:
             pass
 
-        confirm_buttons = [
-            "button:has-text('Salvar')",
-            "button:has-text('Confirmar')",
-            "button:has-text('Registrar')",
-            "button:has-text('OK')",
-            "button:has-text('Enviar')",
-            "button[type='submit']",
-            "[role='button']:has-text('Salvar')",
-            "[role='button']:has-text('Confirmar')",
-            "input[type='submit']",
-        ]
-        self._click_first(page, confirm_buttons, timeout_ms=8000)
-        page.wait_for_timeout(1200)
+        self._click_first(page, self.config.reason_modal_confirm_buttons, timeout_ms=confirm_to)
+        if after_to:
+            page.wait_for_timeout(after_to)
 
     def _is_reason_modal_visible(self, page) -> bool:
-        modal_indicators = [
-            "text='Bater seu ponto'",
-            ".modal:has-text('Bater seu ponto')",
-            ".modal-dialog",
-            "[role='dialog']",
-        ]
-        for selector in modal_indicators:
+        for selector in self.config.reason_modal_indicators:
             for ctx in self._iter_contexts(page):
                 try:
                     locator = ctx.locator(selector).first
@@ -384,16 +520,7 @@ class MyworkApiClient:
         return False
 
     def _has_visible_error_feedback(self, page) -> bool:
-        error_selectors = [
-            ".alert-danger",
-            ".error",
-            ".toast-error",
-            "text='erro'",
-            "text='falha'",
-            "text='inválido'",
-            "text='obrigatório'",
-        ]
-        for selector in error_selectors:
+        for selector in self.config.visible_error_feedback_selectors:
             for ctx in self._iter_contexts(page):
                 try:
                     locator = ctx.locator(selector).first
@@ -405,79 +532,32 @@ class MyworkApiClient:
 
     def _reason_text_for_punch(self, punch_type: str) -> str:
         normalized = (punch_type or "").strip().lower()
+        extra = (self.config.reason_by_punch_type or {}).get(normalized)
+        if extra:
+            return extra
         by_type = {
-            "Entrada": self.config.reason_entrada,
-            "Pausa": self.config.reason_pausa,
-            "Retorno": self.config.reason_retorno,
-            "Saída": self.config.reason_saida,
+            "entrada": self.config.reason_entrada,
+            "pausa": self.config.reason_pausa,
+            "retorno": self.config.reason_retorno,
+            "saida": self.config.reason_saida,
         }
         return by_type.get(normalized, normalized or "registro")
 
     def _selectors_for_punch(self, punch_type: str) -> list[str]:
-        base = [
-            self.config.punch_button_selector,
-            "button:has-text('Bater ponto')",
-            "button:has-text('Registrar ponto')",
-            "button:has-text('Marcar ponto')",
-            "[role='button']:has-text('Bater ponto')",
-            "[role='button']:has-text('Registrar ponto')",
-            "a:has-text('Bater ponto')",
-            "a:has-text('Registrar ponto')",
-            "[aria-label*='ponto' i]",
-            "[title*='ponto' i]",
-        ]
-        per_type = {
-            "entrada": [
-                "button:has-text('Entrada')",
-                "button:has-text('Iniciar jornada')",
-                "button:has-text('Iniciar expediente')",
-                "[role='button']:has-text('Entrada')",
-                "a:has-text('Entrada')",
-            ],
-            "pausa": [
-                "button:has-text('Pausa')",
-                "button:has-text('Intervalo')",
-                "button:has-text('Iniciar pausa')",
-                "button:has-text('Iniciar intervalo')",
-                "[role='button']:has-text('Pausa')",
-                "[role='button']:has-text('Intervalo')",
-                "a:has-text('Pausa')",
-                "a:has-text('Intervalo')",
-            ],
-            "retorno": [
-                "button:has-text('Retorno')",
-                "button:has-text('Voltar')",
-                "button:has-text('Fim da pausa')",
-                "button:has-text('Fim do intervalo')",
-                "[role='button']:has-text('Retorno')",
-                "a:has-text('Retorno')",
-            ],
-            "saida": [
-                "button:has-text('Saida')",
-                "button:has-text('Saída')",
-                "button:has-text('Encerrar jornada')",
-                "button:has-text('Encerrar expediente')",
-                "[role='button']:has-text('Saída')",
-                "[role='button']:has-text('Saida')",
-                "a:has-text('Saída')",
-                "a:has-text('Saida')",
-            ],
-        }
-        return [*base, *per_type.get((punch_type or "").lower(), [])]
+        base = self._unique_selectors(
+            [self.config.punch_button_selector, *self.config.punch_selectors_base]
+        )
+        pt = (punch_type or "").lower()
+        extra = self.config.punch_selectors_by_type.get(pt, [])
+        return [*base, *extra]
 
     def _try_open_punch_area(self, page) -> None:
-        navigation_selectors = [
-            "a:has-text('Ponto')",
-            "a:has-text('Meu ponto')",
-            "a:has-text('Jornada')",
-            "button:has-text('Ponto')",
-            "[role='button']:has-text('Ponto')",
-            "[href*='ponto' i]",
-            "[href*='time' i]",
-        ]
+        menu_to = max(500, int(self.config.playwright_menu_click_timeout_ms))
+        after_to = max(0, int(self.config.playwright_menu_after_click_ms))
         try:
-            self._click_first(page, navigation_selectors, timeout_ms=4000)
-            page.wait_for_timeout(1500)
+            self._click_first(page, self.config.navigation_menu_selectors, timeout_ms=menu_to)
+            if after_to:
+                page.wait_for_timeout(after_to)
         except Exception:
             return
 

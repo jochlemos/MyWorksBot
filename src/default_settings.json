@@ -1,0 +1,223 @@
+{
+  "login_url": "https://app.mywork.com.br/",
+  "punch_page_url": "https://app.mywork.com.br/ponto",
+  "punch_page_url_redirects": {
+    "https://app.mywork.com.br": "https://app.mywork.com.br/ponto",
+    "https://app.mywork.com.br/": "https://app.mywork.com.br/ponto"
+  },
+  "email_selector": "input[type='email']",
+  "password_selector": "input[type='password']",
+  "submit_selector": "button[type='submit']",
+  "punch_button_selector": "button:has-text('Bater ponto')",
+  "reason_entrada": "entrada",
+  "reason_pausa": "pausa",
+  "reason_retorno": "retorno",
+  "reason_saida": "saida",
+  "reason_by_punch_type": {},
+  "prevent_same_description": true,
+  "tolerance_minutes": 5,
+  "auto_start_windows": false,
+  "headless_browser": false,
+  "browser_pause_seconds": 15,
+  "browser_pause_max_seconds": 120,
+  "punch_types": ["entrada", "pausa", "retorno", "saida"],
+  "scheduler_poll_interval_seconds": 20,
+  "duplicate_guard_seconds": 90,
+  "auto_failure_cooldown_minutes": 3,
+  "retry_cooldown_minutes": 5,
+  "enable_offline_retry": false,
+  "robot_ui_timeout_ms": 300000,
+  "next_appointments_count": 3,
+  "logs_display_limit": 300,
+  "history_display_limit": 500,
+  "logs_max_stored": 2000,
+  "history_max_stored": 5000,
+  "playwright_navigation_timeout_ms": 30000,
+  "playwright_field_timeout_ms": 12000,
+  "playwright_post_login_stabilize_ms": 800,
+  "playwright_login_wait_timeout_ms": 30000,
+  "playwright_login_poll_ms": 400,
+  "playwright_login_transition_ms": 600,
+  "playwright_punch_click_timeout_ms": 15000,
+  "playwright_history_wait_timeout_ms": 20000,
+  "playwright_history_poll_step_ms": 1000,
+  "playwright_reason_modal_fill_timeout_ms": 3000,
+  "playwright_reason_modal_confirm_timeout_ms": 8000,
+  "playwright_reason_modal_after_click_ms": 1200,
+  "playwright_menu_click_timeout_ms": 4000,
+  "playwright_menu_after_click_ms": 1500,
+  "selector_fallback_email": [
+    "input[type='email']",
+    "input[name='email']",
+    "input[name='username']",
+    "input[name='login']",
+    "input[id*='email']",
+    "input[id*='user']",
+    "input[type='text']"
+  ],
+  "selector_fallback_password": [
+    "input[type='password']",
+    "input[name='password']",
+    "input[id*='pass']"
+  ],
+  "selector_fallback_submit": [
+    "button[type='submit']",
+    "button:has-text('Entrar')",
+    "button:has-text('Login')",
+    "input[type='submit']"
+  ],
+  "login_error_selectors": [
+    ".alert-danger",
+    ".alert-error",
+    "[role='alert']",
+    "text=Credenciais inválidas",
+    "text=usuário ou senha incorretos",
+    "text=Senha incorreta",
+    "text=Dados inválidos"
+  ],
+  "still_on_login_password_selector": "input[type='password']:visible",
+  "still_on_login_submit_selectors": [
+    "button[type='submit']:visible",
+    "button:has-text('Entrar'):visible",
+    "button:has-text('Login'):visible"
+  ],
+  "login_wait_redirect_path_substrings": ["/login", "signin", "/sign-in"],
+  "login_wait_oauth_substring_markers": ["auth.", "callback"],
+  "logged_in_ui_markers": [
+    "text='Bater ponto'",
+    "text='Bater seu ponto'",
+    "text='Histórico de pontos'",
+    "a:has-text('Ponto')",
+    "nav >> text=Ponto",
+    "text='Sair'",
+    "text='Logout'"
+  ],
+  "punch_context_url_substrings": ["/ponto"],
+  "punch_context_indicators": [
+    "text='Bater ponto'",
+    "text='Bater seu ponto'",
+    "text='Histórico de pontos'",
+    "h1:has-text('Ponto')",
+    "h2:has-text('Ponto')"
+  ],
+  "navigation_menu_selectors": [
+    "a:has-text('Ponto')",
+    "a:has-text('Meu ponto')",
+    "a:has-text('Jornada')",
+    "button:has-text('Ponto')",
+    "[role='button']:has-text('Ponto')",
+    "[href*='ponto' i]",
+    "[href*='time' i]"
+  ],
+  "punch_selectors_base": [
+    "button:has-text('Bater ponto')",
+    "button:has-text('Registrar ponto')",
+    "button:has-text('Marcar ponto')",
+    "[role='button']:has-text('Bater ponto')",
+    "[role='button']:has-text('Registrar ponto')",
+    "a:has-text('Bater ponto')",
+    "a:has-text('Registrar ponto')",
+    "[aria-label*='ponto' i]",
+    "[title*='ponto' i]"
+  ],
+  "punch_selectors_by_type": {
+    "entrada": [
+      "button:has-text('Entrada')",
+      "button:has-text('Iniciar jornada')",
+      "button:has-text('Iniciar expediente')",
+      "[role='button']:has-text('Entrada')",
+      "a:has-text('Entrada')"
+    ],
+    "pausa": [
+      "button:has-text('Pausa')",
+      "button:has-text('Intervalo')",
+      "button:has-text('Iniciar pausa')",
+      "button:has-text('Iniciar intervalo')",
+      "[role='button']:has-text('Pausa')",
+      "[role='button']:has-text('Intervalo')",
+      "a:has-text('Pausa')",
+      "a:has-text('Intervalo')"
+    ],
+    "retorno": [
+      "button:has-text('Retorno')",
+      "button:has-text('Voltar')",
+      "button:has-text('Fim da pausa')",
+      "button:has-text('Fim do intervalo')",
+      "[role='button']:has-text('Retorno')",
+      "a:has-text('Retorno')"
+    ],
+    "saida": [
+      "button:has-text('Saida')",
+      "button:has-text('Saída')",
+      "button:has-text('Encerrar jornada')",
+      "button:has-text('Encerrar expediente')",
+      "[role='button']:has-text('Saída')",
+      "[role='button']:has-text('Saida')",
+      "a:has-text('Saída')",
+      "a:has-text('Saida')"
+    ]
+  },
+  "reason_modal_fields": [
+    "textarea",
+    "input[placeholder*='Coment' i]",
+    "input[placeholder*='coment' i]",
+    "input[placeholder*='ponto' i]",
+    "textarea[name*='motivo' i]",
+    "textarea[id*='motivo' i]",
+    "textarea[name*='comment' i]",
+    "textarea[id*='comment' i]",
+    "input[name*='motivo' i]",
+    "input[id*='motivo' i]",
+    "input[name*='comment' i]",
+    "input[id*='comment' i]"
+  ],
+  "reason_modal_confirm_buttons": [
+    "button:has-text('Salvar')",
+    "button:has-text('Confirmar')",
+    "button:has-text('Registrar')",
+    "button:has-text('OK')",
+    "button:has-text('Enviar')",
+    "button[type='submit']",
+    "[role='button']:has-text('Salvar')",
+    "[role='button']:has-text('Confirmar')",
+    "input[type='submit']"
+  ],
+  "reason_modal_indicators": [
+    "text='Bater seu ponto'",
+    ".modal:has-text('Bater seu ponto')",
+    ".modal-dialog",
+    "[role='dialog']"
+  ],
+  "visible_error_feedback_selectors": [
+    ".alert-danger",
+    ".error",
+    ".toast-error",
+    "text='erro'",
+    "text='falha'",
+    "text='inválido'",
+    "text='obrigatório'"
+  ],
+  "history_marker_selectors": [
+    "table tbody tr:first-child td:first-child",
+    ".table tbody tr:first-child td:first-child",
+    "tbody tr:first-child td:first-child"
+  ],
+  "history_comment_cell_selectors": [
+    "table tbody tr:first-child td:nth-child(6)",
+    ".table tbody tr:first-child td:nth-child(6)",
+    "tbody tr:first-child td:nth-child(6)"
+  ],
+  "profiles": [
+    {
+      "name": "Dias úteis",
+      "enabled": true,
+      "weekdays": [0, 1, 2, 3, 4],
+      "events": [
+        { "time": "08:00", "punch_type": "entrada", "description": "" },
+        { "time": "12:00", "punch_type": "pausa", "description": "" },
+        { "time": "13:00", "punch_type": "retorno", "description": "" },
+        { "time": "18:00", "punch_type": "saida", "description": "" }
+      ]
+    }
+  ]
+}

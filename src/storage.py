@@ -2,7 +2,8 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from src.models import AppConfig, LogRecord, ScheduleEvent, ScheduleProfile
+from src.defaults_loader import deep_merge, load_bundled_defaults
+from src.models import AppConfig, LogRecord, app_config_from_merged_dict
 
 
 class Storage:
@@ -13,66 +14,49 @@ class Storage:
         self.logs_file = self.app_dir / "logs.json"
         self.history_file = self.app_dir / "history.json"
         self.runtime_file = self.app_dir / "runtime_state.json"
+        bundled = load_bundled_defaults()
+        self.logs_max_stored = int(bundled.get("logs_max_stored", 2000))
+        self.history_max_stored = int(bundled.get("history_max_stored", 5000))
 
     def load_config(self) -> AppConfig:
+        defaults = load_bundled_defaults()
         if not self.config_file.exists():
-            cfg = AppConfig(
-                profiles=[
-                    ScheduleProfile(
-                        name="Dias úteis",
-                        weekdays=[0, 1, 2, 3, 4],
-                        events=[
-                            ScheduleEvent(time="08:00", punch_type="entrada"),
-                            ScheduleEvent(time="12:00", punch_type="pausa"),
-                            ScheduleEvent(time="13:00", punch_type="retorno"),
-                            ScheduleEvent(time="18:00", punch_type="saida"),
-                        ],
-                    )
-                ]
-            )
+            merged = dict(defaults)
+            cfg = app_config_from_merged_dict(merged)
+            self._sync_store_limits(cfg)
             self.save_config(cfg)
             return cfg
 
-        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
-        profiles: list[ScheduleProfile] = []
-        for p in raw.get("profiles", []):
-            events = [ScheduleEvent(**e) for e in p.get("events", [])]
-            profiles.append(
-                ScheduleProfile(
-                    name=p.get("name", "Perfil"),
-                    enabled=p.get("enabled", True),
-                    weekdays=p.get("weekdays", [0, 1, 2, 3, 4]),
-                    events=events,
-                )
-            )
-        return AppConfig(
-            login_url=raw.get("login_url", "https://app.mywork.com.br/"),
-            punch_page_url=raw.get("punch_page_url", "https://app.mywork.com.br/ponto"),
-            email_selector=raw.get("email_selector", "input[type='email']"),
-            password_selector=raw.get("password_selector", "input[type='password']"),
-            submit_selector=raw.get("submit_selector", "button[type='submit']"),
-            punch_button_selector=raw.get("punch_button_selector", "button:has-text('Bater ponto')"),
-            reason_entrada=raw.get("reason_entrada", "entrada"),
-            reason_pausa=raw.get("reason_pausa", "pausa"),
-            reason_retorno=raw.get("reason_retorno", "retorno"),
-            reason_saida=raw.get("reason_saida", "saida"),
-            prevent_same_description=bool(raw.get("prevent_same_description", True)),
-            tolerance_minutes=int(raw.get("tolerance_minutes", 5)),
-            auto_start_windows=bool(raw.get("auto_start_windows", False)),
-            headless_browser=bool(raw.get("headless_browser", False)),
-            profiles=profiles,
-        )
+        try:
+            user_raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+            if not isinstance(user_raw, dict):
+                user_raw = {}
+        except (OSError, json.JSONDecodeError):
+            user_raw = {}
+
+        merged = deep_merge(defaults, user_raw)
+        cfg = app_config_from_merged_dict(merged)
+        self._sync_store_limits(cfg)
+        return cfg
+
+    def _sync_store_limits(self, config: AppConfig) -> None:
+        self.logs_max_stored = max(1, int(config.logs_max_stored))
+        self.history_max_stored = max(1, int(config.history_max_stored))
 
     def save_config(self, config: AppConfig) -> None:
+        self._sync_store_limits(config)
         self.config_file.write_text(
             json.dumps(asdict(config), indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
     def append_log(self, record: LogRecord) -> None:
-        data = self.get_logs(limit=2000)
+        cap = self.logs_max_stored
+        data = self.get_logs(limit=cap)
         data.append(record.to_dict())
-        data = data[-2000:]
-        self.logs_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        data = data[-cap:]
+        self.logs_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
     def get_logs(self, limit: int = 200) -> list[dict]:
         if not self.logs_file.exists():
@@ -84,7 +68,8 @@ class Storage:
         self.logs_file.write_text("[]", encoding="utf-8")
 
     def append_history(self, entry: dict) -> None:
-        data = self.get_history(limit=5000)
+        cap = self.history_max_stored
+        data = self.get_history(limit=cap)
         if data:
             last = data[-1]
             same_as_last = (
@@ -96,7 +81,7 @@ class Storage:
             if same_as_last:
                 return
         data.append(entry)
-        data = data[-5000:]
+        data = data[-cap:]
         self.history_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def get_history(self, limit: int = 300) -> list[dict]:

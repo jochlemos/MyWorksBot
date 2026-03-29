@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 
+from PySide6.QtCore import QMetaObject, Qt
 from PySide6.QtWidgets import QApplication
 
 from src.api_client import MyworkApiClient
@@ -64,7 +65,10 @@ class AppController:
                     "name": p.name,
                     "enabled": p.enabled,
                     "weekdays": p.weekdays,
-                    "events": [{"time": e.time, "punch_type": e.punch_type} for e in p.events],
+                    "events": [
+                        {"time": e.time, "punch_type": e.punch_type, "description": e.description}
+                        for e in p.events
+                    ],
                 }
                 for p in self.config.profiles
             ],
@@ -78,13 +82,15 @@ class AppController:
         return "Agendador ativo"
 
     def get_logs_text(self) -> str:
-        logs = self.storage.get_logs(limit=300)
+        limit = max(1, int(self.config.logs_display_limit))
+        logs = self.storage.get_logs(limit=limit)
         return "\n".join(
             [f"[{x['timestamp']}] {x['level']}: {x['message']} {x.get('details', {})}" for x in logs]
         )
 
     def get_history_text(self) -> str:
-        history = self.storage.get_history(limit=500)
+        limit = max(1, int(self.config.history_display_limit))
+        history = self.storage.get_history(limit=limit)
         if not history:
             return "Sem registros ainda."
         return "\n".join(
@@ -113,19 +119,31 @@ class AppController:
     def log(self, level: str, message: str, details=None) -> None:
         self.storage.append_log(LogRecord.create(level, message, details))
         if self.window:
-            self.window.refresh_logs()
-            self.window.refresh_history()
+            QMetaObject.invokeMethod(
+                self.window,
+                "request_refresh_logs_ui",
+                Qt.ConnectionType.QueuedConnection,
+            )
 
     def notify(self, message: str) -> None:
-        if self.window:
-            self.window.notify(message)
+        if not self.window:
+            return
+        self.window.enqueue_notify(message)
 
-    def manual_punch(self, punch_type: str, custom_reason: str | None = None) -> tuple[bool, str]:
-        return self.scheduler.manual_punch(punch_type, custom_reason=custom_reason)
+    def robot_step(self, message: str) -> None:
+        self.log("INFO", f"Robô: {message}")
 
-    def test_connection(self) -> tuple[bool, str]:
+    def manual_punch(
+        self,
+        punch_type: str,
+        custom_reason: str | None = None,
+        on_step=None,
+    ) -> tuple[bool, str]:
+        return self.scheduler.manual_punch(punch_type, custom_reason=custom_reason, on_step=on_step)
+
+    def test_connection(self, on_step=None) -> tuple[bool, str]:
         client = MyworkApiClient(self.config, self.email, self.password)
-        return client.test_connection()
+        return client.test_connection(on_step=on_step)
 
     def quit_app(self) -> None:
         self.scheduler.stop()
