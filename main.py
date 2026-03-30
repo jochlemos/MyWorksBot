@@ -1,6 +1,13 @@
 import argparse
 import json
+import os
 import sys
+
+# PyInstaller (--onefile): Chromium is shipped under sys._MEIPASS/playwright-browsers (see build.ps1).
+if getattr(sys, "frozen", False):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(
+        sys._MEIPASS, "playwright-browsers"
+    )
 
 from PySide6.QtCore import QMetaObject, Qt
 from PySide6.QtWidgets import QApplication

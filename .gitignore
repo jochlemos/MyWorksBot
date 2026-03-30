@@ -1,5 +1,7 @@
 .venv/
 venv/
+dist/
+build/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -12,3 +14,6 @@ __pycache__/
 htmlcov/
 .DS_Store
 Thumbs.db
+
+# Chromium empacotado para o PyInstaller (gerado pelo build.ps1)
+playwright-browsers/

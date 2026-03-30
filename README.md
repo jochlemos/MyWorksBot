@@ -151,11 +151,19 @@ Credenciais ficam em arquivo separado gerido por `src/security.py` (DPAPI).
 
 ## Build do executável
 
+O script **`build.ps1`** instala dependências, baixa o **Chromium** do Playwright para a pasta local `playwright-browsers/` (não vai para o Git) e gera um único **`dist\MyworkPontoBot.exe`** com o navegador embutido, para rodar em outro PC Windows **sem** `playwright install`.
+
 ```powershell
-pyinstaller --noconfirm --onefile --windowed --name MyworkPontoBot main.py
+.\build.ps1
 ```
 
-Saída típica: `dist\MyworkPontoBot.exe`
+Opcional: `.\build.ps1 -Clean` remove `build/`, `dist/` e refaz tudo.
+
+- **Tamanho:** o `.exe` fica grande (centenas de MB), pois inclui o Chromium.
+- **Plataforma:** build e binário são **Windows x64**; o Chromium empacotado é o `win64` da versão do Playwright em `requirements.txt`.
+- **Reprodutibilidade:** ao atualizar o pacote `playwright`, rode de novo o `build.ps1` para alinhar a revisão do Chromium.
+
+Desenvolvimento sem empacotar: `python main.py` continua usando o cache do usuário (`python -m playwright install chromium` uma vez na máquina).
 
 ---
 
