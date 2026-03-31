@@ -42,7 +42,6 @@ class AppController:
 
     def start(self) -> None:
         self.scheduler.start()
-        self.log("INFO", "Aplicação iniciada.")
 
     def get_config_and_credentials(self) -> tuple[AppConfig, str, str]:
         self.config.auto_start_windows = is_startup_enabled()

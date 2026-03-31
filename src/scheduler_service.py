@@ -114,8 +114,11 @@ class SchedulerService:
         state = self.storage.load_runtime_state()
         executions = state.get("executions", {})
         failed_attempts = state.get("failed_attempts", {})
+        pending_confirmations = state.get("pending_confirmations", {})
         today_key = now.strftime("%Y-%m-%d")
         tolerance = max(0, int(cfg.tolerance_minutes))
+
+        pending_confirmations = self._process_pending_confirmations(pending_confirmations, now, today_key)
 
         for profile in cfg.profiles:
             if not profile.enabled or weekday not in profile.weekdays:
@@ -141,18 +144,47 @@ class SchedulerService:
                 now_minutes = now.hour * 60 + now.minute
                 if abs(now_minutes - target_minutes) <= tolerance:
                     custom = (ev.description or "").strip() or None
-                    success, _ = self._execute_punch(ev.punch_type, source="auto", custom_reason=custom)
+                    success, msg = self._execute_punch(ev.punch_type, source="auto", custom_reason=custom)
                     if success:
                         executions[key] = now.isoformat()
                         failed_attempts.pop(key, None)
                     else:
-                        failed_attempts[key] = now.isoformat()
+                        if self._is_unconfirmed_submission(msg):
+                            delay_min = max(1, int(cfg.uncertain_confirmation_recheck_minutes))
+                            next_check = now + timedelta(minutes=delay_min)
+                            pending_confirmations[key] = {
+                                "created_at": now.isoformat(timespec="seconds"),
+                                "next_check_at": next_check.isoformat(timespec="seconds"),
+                                "punch_type": ev.punch_type,
+                                "reason": custom or "",
+                                "profile": profile.name,
+                                "event_time": ev.time,
+                                "attempt_source": "auto",
+                            }
+                            executions[key] = now.isoformat()
+                            failed_attempts.pop(key, None)
+                            self.on_log(
+                                "WARN",
+                                "Registro sem confirmação imediata; reexecução bloqueada e verificação tardia agendada.",
+                                {
+                                    "punch_type": ev.punch_type,
+                                    "profile": profile.name,
+                                    "event_time": ev.time,
+                                    "next_check_at": next_check.isoformat(timespec="seconds"),
+                                    "rule": "pending_confirmation_check",
+                                },
+                            )
+                        else:
+                            failed_attempts[key] = now.isoformat()
         # Recarrega estado para não sobrescrever chaves atualizadas por _execute_punch
         # (ex.: last_successful_punch_at / successful_contents).
         latest_state = self.storage.load_runtime_state()
         latest_state["executions"] = {k: v for k, v in executions.items() if k.startswith(today_key)}
         latest_state["failed_attempts"] = {
             k: v for k, v in failed_attempts.items() if k.startswith(today_key)
+        }
+        latest_state["pending_confirmations"] = {
+            k: v for k, v in pending_confirmations.items() if k.startswith(today_key)
         }
         self.storage.save_runtime_state(latest_state)
 
@@ -175,30 +207,7 @@ class SchedulerService:
             client: MyworkApiClient = self.get_api_client()
             now = datetime.now()
             state = self.storage.load_runtime_state()
-            if self._has_successful_type_today(punch_type, now):
-                self.on_log(
-                    "WARN",
-                    "Registro bloqueado: tipo já registrado com sucesso hoje.",
-                    {
-                        "source": source,
-                        "punch_type": punch_type,
-                        "rule": "type_already_success_today",
-                    },
-                )
-                return False, f"Bloqueado: já existe registro de {punch_type} com sucesso hoje."
             effective_reason = self._effective_reason_text(cfg, punch_type, custom_reason)
-            if self._has_same_content_today(state, now, punch_type, effective_reason):
-                self.on_log(
-                    "WARN",
-                    "Registro bloqueado por conteúdo repetido no dia.",
-                    {
-                        "source": source,
-                        "punch_type": punch_type,
-                        "reason": effective_reason,
-                        "rule": "same_type_and_description_today",
-                    },
-                )
-                return False, "Bloqueado: já existe registro com mesmo tipo e descrição hoje."
             if not self._can_attempt_new_punch(state, now, cfg):
                 sec = int(cfg.duplicate_guard_seconds)
                 msg = (
@@ -232,6 +241,23 @@ class SchedulerService:
                 )
                 self.on_notify(f"Ponto {punch_type} registrado com sucesso.")
                 return True, msg
+
+            if source == "auto" and self._is_unconfirmed_submission(msg):
+                self.on_log(
+                    "WARN",
+                    f"Registro {punch_type} sem confirmação imediata ({source}).",
+                    {"api": msg, "rule": "pending_confirmation_check"},
+                )
+                self._append_history(
+                    punch_type=punch_type,
+                    source=source,
+                    success=False,
+                    message=f"Pendente de confirmação: {msg}",
+                )
+                self.on_notify(
+                    f"Registro {punch_type} pendente de confirmação. Nova checagem será feita depois."
+                )
+                return False, msg
 
             self.on_log("ERROR", f"Falha ao registrar ponto {punch_type} ({source}).", {"api": msg})
             self._append_history(
@@ -309,6 +335,73 @@ class SchedulerService:
         }
         return fallback.get(pt, pt or "registro")
 
+    @staticmethod
+    def _is_unconfirmed_submission(msg: str) -> bool:
+        text = (msg or "").strip().lower()
+        return "não houve confirmação no histórico" in text or "nao houve confirmacao no historico" in text
+
+    def _process_pending_confirmations(
+        self,
+        pending_confirmations: dict,
+        now: datetime,
+        today_key: str,
+    ) -> dict:
+        if not isinstance(pending_confirmations, dict):
+            return {}
+        client: MyworkApiClient = self.get_api_client()
+        if not client.is_configured():
+            return pending_confirmations
+        next_state: dict = {}
+        for key, item in pending_confirmations.items():
+            if not str(key).startswith(today_key):
+                continue
+            if not isinstance(item, dict):
+                continue
+            due_raw = str(item.get("next_check_at", "") or "")
+            due_at: datetime | None = None
+            if due_raw:
+                try:
+                    due_at = datetime.fromisoformat(due_raw)
+                except ValueError:
+                    due_at = None
+            if due_at and now < due_at:
+                next_state[key] = item
+                continue
+            punch_type = str(item.get("punch_type", "") or "").strip().lower()
+            if not punch_type:
+                continue
+            ok, msg = client.verify_punch_in_history(
+                punch_type,
+                on_step=lambda m: self.on_log("INFO", f"Robô (verificação tardia): {m}"),
+            )
+            details = {
+                "punch_type": punch_type,
+                "profile": item.get("profile", ""),
+                "event_time": item.get("event_time", ""),
+                "rule": "pending_confirmation_check",
+            }
+            if ok:
+                self.on_log("INFO", "Verificação tardia confirmou registro na tabela.", {**details, "api": msg})
+                self._append_history(
+                    punch_type=punch_type,
+                    source="auto-verify",
+                    success=True,
+                    message=msg,
+                )
+            else:
+                self.on_log(
+                    "WARN",
+                    "Verificação tardia não confirmou registro na tabela.",
+                    {**details, "api": msg},
+                )
+                self._append_history(
+                    punch_type=punch_type,
+                    source="auto-verify",
+                    success=False,
+                    message=msg,
+                )
+        return next_state
+
     def _prune_successful_contents(self, state: dict, now: datetime) -> list[dict]:
         day = now.strftime("%Y-%m-%d")
         raw = state.get("successful_contents", [])
@@ -335,16 +428,32 @@ class SchedulerService:
         punch_type: str,
         reason: str,
     ) -> bool:
-        day_items = self._prune_successful_contents(state, now)
-        state["successful_contents"] = day_items
+        # Valida pelo histórico persistido de sucessos no dia para evitar falso
+        # positivo quando runtime_state fica desatualizado/sujo.
+        today = now.strftime("%Y-%m-%d")
         ptype_norm = self._normalize_text(punch_type)
         reason_norm = self._normalize_text(reason)
-        for item in day_items:
-            if (
-                self._normalize_text(item.get("punch_type", "")) == ptype_norm
-                and self._normalize_text(item.get("reason", "")) == reason_norm
-            ):
-                return True
+        if not ptype_norm:
+            return False
+        entries = self.storage.get_history(limit=max(300, int(self.storage.history_max_stored)))
+        for item in entries:
+            try:
+                ts = str(item.get("timestamp", "") or "")
+                if not ts.startswith(today):
+                    continue
+                status = self._normalize_text(str(item.get("status", "") or ""))
+                if status != "sucesso":
+                    continue
+                item_ptype = self._normalize_text(str(item.get("punch_type", "") or ""))
+                if item_ptype != ptype_norm:
+                    continue
+                # Histórico antigo pode não ter reason detalhada no message.
+                # Se houver reason explícita no message e bater, bloqueia.
+                msg = self._normalize_text(str(item.get("message", "") or ""))
+                if reason_norm and reason_norm in msg:
+                    return True
+            except Exception:
+                continue
         return False
 
     def _remember_successful_content(

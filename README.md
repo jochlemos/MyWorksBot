@@ -127,6 +127,10 @@ O agendador roda em **thread separada** e, nos horários configurados, chama o m
 ## Robô (Playwright)
 
 - Após preencher e enviar o login, o cliente **espera sinais de sucesso** (URL, elementos da área logada ou da página de ponto) antes de seguir; em caso de erro visível na tela de login, a operação falha com mensagem clara.
+- A confirmação de registro usa o **conteúdo da tabela "Histórico de pontos"** no portal (snapshot antes/depois): só considera sucesso quando a tabela muda (aumenta registros do dia ou muda a primeira linha).
+- Regras de bloqueio por repetição (tipo/descrição) seguem a mesma fonte de verdade para execuções **manuais e agendadas**: o que está visível no histórico da página.
+- Se houver **clique sem confirmação imediata na tabela**, o evento automático entra como **pendente de confirmação**: o app **não reexecuta** a batida para evitar duplicidade e agenda uma **verificação tardia** da tabela.
+- O intervalo da verificação tardia é configurável por `uncertain_confirmation_recheck_minutes` (padrão: **30 min**).
 - Operações pesadas disparadas pela UI rodam em **thread em segundo plano** para não travar a janela; atualizações de log e notificações são encaminhadas para a thread principal do Qt de forma segura.
 - Em execuções **agendadas**, as etapas são logadas com o prefixo `Robô (agendado):`; em **reenvio offline** (se habilitado no código), `Robô (reenvio):`.
 
@@ -143,7 +147,7 @@ Pasta padrão (por usuário Windows):
 | `config.json` | URLs, seletores, perfis, eventos, flags |
 | `logs.json` | Log da aplicação (inclui linhas `Robô: …`) |
 | `history.json` | Histórico de batidas |
-| `runtime_state.json` | Estado do agendador (execuções do dia, etc.) |
+| `runtime_state.json` | Estado do agendador (execuções, falhas e pendências de confirmação do dia) |
 
 Credenciais ficam em arquivo separado gerido por `src/security.py` (DPAPI).
 

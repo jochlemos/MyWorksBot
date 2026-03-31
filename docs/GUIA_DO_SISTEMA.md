@@ -166,6 +166,11 @@ Durante **Testar login**, **Teste de registro** ou outras operações longas do 
   - Calcula se a hora atual está dentro da **tolerância** do horário do evento.
   - Evita repetir a mesma combinação **dia + perfil + tipo + horário** já executada com sucesso (estado em `runtime_state.json`).
   - Respeita **proteção contra batidas muito próximas** (evita duplicidade acidental).
+- O fluxo de validação de batida é o mesmo do manual: a decisão final de sucesso/repetição é baseada no **histórico visível da página** (tabela "Histórico de pontos"), não em regra paralela exclusiva do agendador.
+- Quando o clique acontece, mas não há confirmação imediata na tabela, o evento automático vira **pendente de confirmação**:
+  - o agendador **não repete** a batida no mesmo evento (evita estourar limite diário por duplicidade);
+  - agenda uma **verificação tardia** da tabela para confirmar se o registro apareceu depois.
+- O intervalo dessa verificação tardia é `uncertain_confirmation_recheck_minutes` (padrão **30 minutos**).
 - Em caso de falha, pode aplicar **espera** antes de nova tentativa automática naquele evento (conforme implementação em `scheduler_service.py`).
 
 ---

@@ -71,6 +71,7 @@ class AppConfig:
     duplicate_guard_seconds: int = 90
     auto_failure_cooldown_minutes: int = 3
     retry_cooldown_minutes: int = 5
+    uncertain_confirmation_recheck_minutes: int = 30
     enable_offline_retry: bool = False
     robot_ui_timeout_ms: int = 300_000
     next_appointments_count: int = 3
@@ -166,6 +167,9 @@ def app_config_from_merged_dict(raw: dict[str, Any]) -> AppConfig:
         duplicate_guard_seconds=int(raw.get("duplicate_guard_seconds", 90)),
         auto_failure_cooldown_minutes=int(raw.get("auto_failure_cooldown_minutes", 3)),
         retry_cooldown_minutes=int(raw.get("retry_cooldown_minutes", 5)),
+        uncertain_confirmation_recheck_minutes=int(
+            raw.get("uncertain_confirmation_recheck_minutes", 30)
+        ),
         enable_offline_retry=bool(raw.get("enable_offline_retry", False)),
         robot_ui_timeout_ms=int(raw.get("robot_ui_timeout_ms", 300_000)),
         next_appointments_count=int(raw.get("next_appointments_count", 3)),

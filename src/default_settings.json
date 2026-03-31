@@ -28,6 +28,7 @@
   "duplicate_guard_seconds": 90,
   "auto_failure_cooldown_minutes": 3,
   "retry_cooldown_minutes": 5,
+  "uncertain_confirmation_recheck_minutes": 30,
   "enable_offline_retry": false,
   "robot_ui_timeout_ms": 300000,
   "next_appointments_count": 3,
@@ -113,6 +114,8 @@
     "[href*='time' i]"
   ],
   "punch_selectors_base": [
+    "div[data-testid='clock-children'] button[type='button']",
+    "div[data-testid='clock-children'] button.ant-btn-primary",
     "button:has-text('Bater ponto')",
     "button:has-text('Registrar ponto')",
     "button:has-text('Marcar ponto')",

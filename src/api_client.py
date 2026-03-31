@@ -1,4 +1,5 @@
 import time
+import hashlib
 
 from collections.abc import Callable
 from datetime import datetime
@@ -129,30 +130,61 @@ class MyworkApiClient:
                             False,
                             "Bloqueado: a última descrição no histórico é igual à nova descrição.",
                         )
-                marker_before = self._get_history_marker(page)
+                self._wait_for_history_ready(page, timeout_ms=min(hist_to, 6000))
+                history_before = self._history_snapshot(page)
+                self._step(
+                    on_step,
+                    f"Snapshot histórico (antes): hoje={history_before.get('today_count', 0)}, "
+                    f"primeira_linha_hash={history_before.get('first_row_hash', '')}.",
+                )
+                self._step(on_step, "Aguardando controles de ação de ponto ficarem prontos.")
+                self._wait_for_punch_action_ready(page, punch_type=punch_type, timeout_ms=min(punch_to, 8000))
                 self._step(on_step, f"Clicando no tipo de batida: {punch_type}.")
                 try:
-                    self._click_first(
+                    used_selector = self._click_first_with_selector(
                         page,
                         self._selectors_for_punch(punch_type),
                         timeout_ms=punch_to,
                     )
+                    self._step(on_step, f"Clique executado com seletor: {used_selector}")
                 except RuntimeError:
                     self._step(on_step, "Tentando abrir área de ponto pelo menu.")
                     self._try_open_punch_area(page)
-                    self._click_first(
+                    used_selector = self._click_first_with_selector(
                         page,
                         self._selectors_for_punch(punch_type),
                         timeout_ms=punch_to,
                     )
+                    self._step(on_step, f"Clique executado após menu com seletor: {used_selector}")
                 self._step(on_step, "Preenchendo motivo / modal (se aparecer).")
-                self._handle_reason_modal(page, punch_type, custom_reason=reason_text)
-                self._step(on_step, "Aguardando confirmação no histórico de pontos.")
-                if not self._wait_for_history_change(page, marker_before, timeout_ms=hist_to):
+                modal_status = self._handle_reason_modal(
+                    page, punch_type, custom_reason=reason_text, on_step=on_step
+                )
+                self._step(
+                    on_step,
+                    "Status modal: "
+                    f"visivel={modal_status.get('modal_visible')}, "
+                    f"preenchido={modal_status.get('filled')}, "
+                    f"confirmado={modal_status.get('confirmed')}.",
+                )
+                self._step(on_step, "Aguardando atualização da tabela de histórico.")
+                history_changed = self._wait_for_history_change(
+                    page, history_before, punch_type=punch_type, timeout_ms=hist_to
+                )
+                if not history_changed:
+                    history_after = self._history_snapshot(page)
+                    self._step(
+                        on_step,
+                        f"Snapshot histórico (depois): hoje={history_after.get('today_count', 0)}, "
+                        f"primeira_linha_hash={history_after.get('first_row_hash', '')}.",
+                    )
                     if self._has_visible_error_feedback(page):
                         raise RuntimeError(
                             "Clique executado, mas a tela exibiu erro de validação/confirmação."
                         )
+                    raise RuntimeError(
+                        "Clique executado, mas não houve confirmação no histórico dentro do tempo esperado."
+                    )
                 self._apply_post_run_pause(page, on_step)
                 self._step(on_step, "Encerrando navegador.")
                 browser.close()
@@ -186,6 +218,33 @@ class MyworkApiClient:
             return True, "Login automatizado executado."
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
+
+    def verify_punch_in_history(
+        self,
+        punch_type: str,
+        on_step: RobotStepCallback = None,
+    ) -> tuple[bool, str]:
+        if not self.is_configured():
+            return False, "Robô não configurado (credenciais/URLs/seletores)."
+        post_login = max(0, int(self.config.playwright_post_login_stabilize_ms))
+        try:
+            with sync_playwright() as p:
+                self._step(on_step, "Verificação tardia: iniciando navegador.")
+                browser = p.chromium.launch(headless=self.config.headless_browser)
+                page = browser.new_page()
+                self._perform_login(page, on_step)
+                if post_login:
+                    page.wait_for_timeout(post_login)
+                self._ensure_on_punch_page(page, on_step)
+                self._wait_for_history_ready(page, timeout_ms=6000)
+                count = self._count_today_history_records_by_type(page, punch_type)
+                self._apply_post_run_pause(page, on_step)
+                browser.close()
+                if count > 0:
+                    return True, f"Verificação tardia: encontrado(s) {count} registro(s) de {punch_type} hoje."
+                return False, f"Verificação tardia: nenhum registro de {punch_type} encontrado hoje na tabela."
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Verificação tardia falhou: {exc}"
 
     def _perform_login(self, page, on_step: RobotStepCallback = None) -> None:
         nav_to = self._nav_timeout()
@@ -423,6 +482,9 @@ class MyworkApiClient:
         )
 
     def _click_first(self, page, selectors: list[str], timeout_ms: int) -> None:
+        self._click_first_with_selector(page, selectors, timeout_ms)
+
+    def _click_first_with_selector(self, page, selectors: list[str], timeout_ms: int) -> str:
         errors: list[str] = []
         for selector in self._unique_selectors(selectors):
             for ctx in self._iter_contexts(page):
@@ -432,7 +494,7 @@ class MyworkApiClient:
                         continue
                     button.scroll_into_view_if_needed(timeout=timeout_ms)
                     button.click(timeout=timeout_ms)
-                    return
+                    return selector
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"{selector}: {exc}")
         visible_buttons = self._collect_button_diagnostics(page)
@@ -442,6 +504,32 @@ class MyworkApiClient:
             + f" | URL atual: {page.url}"
             + f" | Botões encontrados: {visible_buttons}"
         )
+
+    def _wait_for_history_ready(self, page, timeout_ms: int = 5000) -> None:
+        elapsed = 0
+        step = 500
+        while elapsed < timeout_ms:
+            snap = self._history_snapshot(page)
+            if int(snap.get("today_count", 0) or 0) > 0 or str(snap.get("first_row_hash", "") or ""):
+                return
+            page.wait_for_timeout(step)
+            elapsed += step
+
+    def _wait_for_punch_action_ready(self, page, punch_type: str, timeout_ms: int = 8000) -> None:
+        selectors = self._selectors_for_punch(punch_type)
+        elapsed = 0
+        step = 400
+        while elapsed < timeout_ms:
+            for selector in selectors:
+                for ctx in self._iter_contexts(page):
+                    try:
+                        loc = ctx.locator(selector).first
+                        if loc.count() > 0 and loc.is_visible():
+                            return
+                    except Exception:
+                        continue
+            page.wait_for_timeout(step)
+            elapsed += step
 
     def _collect_input_diagnostics(self, page) -> str:
         snippets: list[str] = []
@@ -484,19 +572,33 @@ class MyworkApiClient:
             return "nenhum botão visível"
         return "; ".join(snippets[:8])
 
-    def _get_history_marker(self, page) -> str:
-        for selector in self.config.history_marker_selectors:
-            for ctx in self._iter_contexts(page):
+    def _history_snapshot(self, page) -> dict[str, str | int]:
+        today_label = datetime.now().strftime("%d/%m/%Y")
+        first_row_text = ""
+        today_count = 0
+        for ctx in self._iter_contexts(page):
+            try:
+                rows = ctx.locator("table tbody tr").all()
+            except Exception:
+                continue
+            for idx, row in enumerate(rows):
                 try:
-                    cell = ctx.locator(selector).first
-                    if cell.count() == 0:
+                    row_text = self._normalize_text(row.inner_text() or "")
+                    if idx == 0 and row_text and not first_row_text:
+                        first_row_text = row_text
+                    first_cell = row.locator("td").first
+                    if first_cell.count() == 0:
                         continue
-                    text = (cell.inner_text() or "").strip()
-                    if text:
-                        return text
+                    text = (first_cell.inner_text() or "").strip()
+                    if today_label in text:
+                        today_count += 1
                 except Exception:
                     continue
-        return ""
+        return {
+            "today_count": today_count,
+            "first_row_text": first_row_text,
+            "first_row_hash": self._stable_hash(first_row_text),
+        }
 
     def _get_latest_history_comment(self, page) -> str:
         for selector in self.config.history_comment_cell_selectors:
@@ -512,13 +614,20 @@ class MyworkApiClient:
                     continue
         return ""
 
-    def _wait_for_history_change(self, page, marker_before: str, timeout_ms: int) -> bool:
+    def _wait_for_history_change(
+        self,
+        page,
+        history_before: dict[str, str | int],
+        punch_type: str,
+        timeout_ms: int,
+    ) -> bool:
         elapsed = 0
         step = max(200, int(self.config.playwright_history_poll_step_ms))
+        target = self._normalize_text(punch_type)
         while elapsed < timeout_ms:
             try:
                 page.wait_for_timeout(step)
-                marker_after = self._get_history_marker(page)
+                history_after = self._history_snapshot(page)
             except PlaywrightError as exc:
                 # Alguns fluxos fecham/recarregam a página logo após confirmar o ponto.
                 # Neste caso mantemos "sem confirmação" e deixamos o chamador decidir
@@ -527,13 +636,41 @@ class MyworkApiClient:
                 if "target page" in text and "has been closed" in text:
                     return False
                 raise
-            if marker_after and marker_after != marker_before:
+            before_count = int(history_before.get("today_count", 0) or 0)
+            after_count = int(history_after.get("today_count", 0) or 0)
+            after_row = self._normalize_text(str(history_after.get("first_row_text", "") or ""))
+            # Critério forte: número de linhas de hoje aumentou e a primeira linha
+            # contém o tipo esperado. Evita falso positivo por pequena variação
+            # visual/textual sem novo registro real.
+            if after_count > before_count and (not target or target in after_row):
+                return True
+            # Fallback: alguns ambientes podem não expor data de hoje no primeiro
+            # campo da linha, mantendo contagem 0. Nesse caso, só aceita mudança
+            # da primeira linha quando ela contém o tipo esperado.
+            before_row = self._normalize_text(str(history_before.get("first_row_text", "") or ""))
+            if before_count == 0 and after_count == 0 and after_row and after_row != before_row and target in after_row:
                 return True
             elapsed += step
         return False
 
+    @staticmethod
+    def _stable_hash(value: str) -> str:
+        # Hash curto para logs técnicos sem expor texto completo da linha.
+        text = (value or "").strip()
+        if not text:
+            return ""
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        return digest[:10]
+
     def _count_today_history_records(self, page) -> int:
+        snapshot = self._history_snapshot(page)
+        return int(snapshot.get("today_count", 0) or 0)
+
+    def _count_today_history_records_by_type(self, page, punch_type: str) -> int:
         today_label = datetime.now().strftime("%d/%m/%Y")
+        target = self._normalize_text(punch_type)
+        if not target:
+            return 0
         count = 0
         for ctx in self._iter_contexts(page):
             try:
@@ -542,11 +679,14 @@ class MyworkApiClient:
                 continue
             for row in rows:
                 try:
-                    first_cell = row.locator("td").first
-                    if first_cell.count() == 0:
+                    cells = row.locator("td").all()
+                    if not cells:
                         continue
-                    text = (first_cell.inner_text() or "").strip()
-                    if today_label in text:
+                    first_text = (cells[0].inner_text() or "").strip()
+                    if today_label not in first_text:
+                        continue
+                    row_text = self._normalize_text(row.inner_text() or "")
+                    if target in row_text:
                         count += 1
                 except Exception:
                     continue
@@ -577,22 +717,30 @@ class MyworkApiClient:
                     continue
         return False
 
-    def _handle_reason_modal(self, page, punch_type: str, custom_reason: str | None = None) -> None:
+    def _handle_reason_modal(
+        self,
+        page,
+        punch_type: str,
+        custom_reason: str | None = None,
+        on_step: RobotStepCallback = None,
+    ) -> dict[str, bool]:
         reason_text = (custom_reason or "").strip() or self._reason_text_for_punch(punch_type)
         modal_contexts = self._visible_reason_modal_contexts(page)
+        status = {"modal_visible": bool(modal_contexts), "filled": False, "confirmed": False}
         if not modal_contexts:
-            return
+            return status
         fill_to = max(500, int(self.config.playwright_reason_modal_fill_timeout_ms))
         confirm_to = max(500, int(self.config.playwright_reason_modal_confirm_timeout_ms))
         after_to = max(0, int(self.config.playwright_reason_modal_after_click_ms))
         for modal in modal_contexts:
             try:
-                self._fill_first_in_context(
+                filled = self._fill_first_in_context(
                     modal,
                     self.config.reason_modal_fields,
                     value=reason_text,
                     timeout_ms=fill_to,
                 )
+                status["filled"] = status["filled"] or bool(filled)
             except Exception:
                 pass
             if self._click_first_in_context(
@@ -600,9 +748,13 @@ class MyworkApiClient:
                 self.config.reason_modal_confirm_buttons,
                 timeout_ms=confirm_to,
             ):
+                status["confirmed"] = True
                 break
         if after_to:
             page.wait_for_timeout(after_to)
+        if on_step and status["modal_visible"] and not status["confirmed"]:
+            self._step(on_step, "Modal visível, mas sem botão de confirmação clicado.")
+        return status
 
     def _is_reason_modal_visible(self, page) -> bool:
         return bool(self._visible_reason_modal_contexts(page))
@@ -699,12 +851,23 @@ class MyworkApiClient:
         return by_type.get(normalized, normalized or "registro")
 
     def _selectors_for_punch(self, punch_type: str) -> list[str]:
+        known_portal_selectors = [
+            "div[data-testid='clock-children'] button[type='button']",
+            "div[data-testid='clock-children'] button.ant-btn-primary",
+        ]
         base = self._unique_selectors(
-            [self.config.punch_button_selector, *self.config.punch_selectors_base]
+            [*known_portal_selectors, self.config.punch_button_selector, *self.config.punch_selectors_base]
         )
         pt = (punch_type or "").lower()
         extra = self.config.punch_selectors_by_type.get(pt, [])
-        return [*base, *extra]
+        # Prioriza seletores específicos do tipo (pausa/retorno/etc.) para evitar
+        # cliques em links/botões genéricos de "Bater ponto" que apenas navegam.
+        merged = [*extra, *base]
+        if pt and pt != "entrada":
+            # Para tipos diferentes de entrada, evita fallback em links genéricos
+            # que só navegam para a tela (sem acionar registro real).
+            merged = [s for s in merged if not s.strip().lower().startswith("a:has-text(")]
+        return self._unique_selectors(merged)
 
     def _try_open_punch_area(self, page) -> None:
         menu_to = max(500, int(self.config.playwright_menu_click_timeout_ms))
