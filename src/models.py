@@ -65,6 +65,7 @@ class AppConfig:
     browser_pause_max_seconds: int = 120
     punch_types: list[str] = field(default_factory=list)
     scheduler_poll_interval_seconds: int = 20
+    max_records_per_day: int = 4
     duplicate_guard_seconds: int = 90
     auto_failure_cooldown_minutes: int = 3
     retry_cooldown_minutes: int = 5
@@ -157,6 +158,7 @@ def app_config_from_merged_dict(raw: dict[str, Any]) -> AppConfig:
         browser_pause_max_seconds=int(raw.get("browser_pause_max_seconds", 120)),
         punch_types=_str_list("punch_types"),
         scheduler_poll_interval_seconds=int(raw.get("scheduler_poll_interval_seconds", 20)),
+        max_records_per_day=int(raw.get("max_records_per_day", 4)),
         duplicate_guard_seconds=int(raw.get("duplicate_guard_seconds", 90)),
         auto_failure_cooldown_minutes=int(raw.get("auto_failure_cooldown_minutes", 3)),
         retry_cooldown_minutes=int(raw.get("retry_cooldown_minutes", 5)),

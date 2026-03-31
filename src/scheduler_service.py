@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from datetime import datetime
 from datetime import timedelta
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import sleep
 
 from src.api_client import MyworkApiClient
@@ -25,6 +25,7 @@ class SchedulerService:
         self.on_notify = on_notify
         self._stop = Event()
         self._thread: Thread | None = None
+        self._punch_lock = Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -146,9 +147,14 @@ class SchedulerService:
                         failed_attempts.pop(key, None)
                     else:
                         failed_attempts[key] = now.isoformat()
-        state["executions"] = {k: v for k, v in executions.items() if k.startswith(today_key)}
-        state["failed_attempts"] = {k: v for k, v in failed_attempts.items() if k.startswith(today_key)}
-        self.storage.save_runtime_state(state)
+        # Recarrega estado para não sobrescrever chaves atualizadas por _execute_punch
+        # (ex.: last_successful_punch_at / successful_contents).
+        latest_state = self.storage.load_runtime_state()
+        latest_state["executions"] = {k: v for k, v in executions.items() if k.startswith(today_key)}
+        latest_state["failed_attempts"] = {
+            k: v for k, v in failed_attempts.items() if k.startswith(today_key)
+        }
+        self.storage.save_runtime_state(latest_state)
 
     def _execute_punch(
         self,
@@ -157,50 +163,89 @@ class SchedulerService:
         custom_reason: str | None = None,
         on_step: Callable[[str], None] | None = None,
     ) -> tuple[bool, str]:
-        cfg: AppConfig = self.get_config()
-        client: MyworkApiClient = self.get_api_client()
-        now = datetime.now()
-        state = self.storage.load_runtime_state()
-        if not self._can_attempt_new_punch(state, now, cfg):
-            sec = int(cfg.duplicate_guard_seconds)
-            msg = (
-                "Bloqueado para evitar duplicidade: já houve registro recente. "
-                f"Aguarde {sec}s."
+        if not self._punch_lock.acquire(blocking=False):
+            self.on_log(
+                "WARN",
+                "Tentativa de registro ignorada: já existe outra operação em andamento.",
+                {"source": source, "punch_type": punch_type},
             )
-            self.on_log("WARN", "Registro bloqueado por proteção de duplicidade.", {"source": source})
-            return False, msg
-        step_cb: Callable[[str], None] | None
-        if on_step is not None:
-            step_cb = on_step
-        elif source == "auto":
-            step_cb = lambda m: self.on_log("INFO", f"Robô (agendado): {m}")
-        else:
-            step_cb = None
-        ok, msg = client.register_punch(punch_type, custom_reason=custom_reason, on_step=step_cb)
-        if ok:
-            self._mark_last_successful_punch(state, now)
-            self.storage.save_runtime_state(state)
-            self.on_log("INFO", f"Ponto {punch_type} registrado ({source}).", {"api": msg})
+            return False, "Já existe um registro em andamento. Aguarde a conclusão da operação atual."
+        try:
+            cfg: AppConfig = self.get_config()
+            client: MyworkApiClient = self.get_api_client()
+            now = datetime.now()
+            state = self.storage.load_runtime_state()
+            if self._has_successful_type_today(punch_type, now):
+                self.on_log(
+                    "WARN",
+                    "Registro bloqueado: tipo já registrado com sucesso hoje.",
+                    {
+                        "source": source,
+                        "punch_type": punch_type,
+                        "rule": "type_already_success_today",
+                    },
+                )
+                return False, f"Bloqueado: já existe registro de {punch_type} com sucesso hoje."
+            effective_reason = self._effective_reason_text(cfg, punch_type, custom_reason)
+            if self._has_same_content_today(state, now, punch_type, effective_reason):
+                self.on_log(
+                    "WARN",
+                    "Registro bloqueado por conteúdo repetido no dia.",
+                    {
+                        "source": source,
+                        "punch_type": punch_type,
+                        "reason": effective_reason,
+                        "rule": "same_type_and_description_today",
+                    },
+                )
+                return False, "Bloqueado: já existe registro com mesmo tipo e descrição hoje."
+            if not self._can_attempt_new_punch(state, now, cfg):
+                sec = int(cfg.duplicate_guard_seconds)
+                msg = (
+                    "Bloqueado para evitar duplicidade: já houve registro recente. "
+                    f"Aguarde {sec}s."
+                )
+                self.on_log(
+                    "WARN",
+                    "Registro bloqueado por proteção de duplicidade.",
+                    {"source": source, "rule": "duplicate_guard_seconds"},
+                )
+                return False, msg
+            step_cb: Callable[[str], None] | None
+            if on_step is not None:
+                step_cb = on_step
+            elif source == "auto":
+                step_cb = lambda m: self.on_log("INFO", f"Robô (agendado): {m}")
+            else:
+                step_cb = None
+            ok, msg = client.register_punch(punch_type, custom_reason=custom_reason, on_step=step_cb)
+            if ok:
+                self._mark_last_successful_punch(state, now)
+                self._remember_successful_content(state, now, punch_type, effective_reason)
+                self.storage.save_runtime_state(state)
+                self.on_log("INFO", f"Ponto {punch_type} registrado ({source}).", {"api": msg})
+                self._append_history(
+                    punch_type=punch_type,
+                    source=source,
+                    success=True,
+                    message=msg,
+                )
+                self.on_notify(f"Ponto {punch_type} registrado com sucesso.")
+                return True, msg
+
+            self.on_log("ERROR", f"Falha ao registrar ponto {punch_type} ({source}).", {"api": msg})
             self._append_history(
                 punch_type=punch_type,
                 source=source,
-                success=True,
+                success=False,
                 message=msg,
             )
-            self.on_notify(f"Ponto {punch_type} registrado com sucesso.")
-            return True, msg
-
-        self.on_log("ERROR", f"Falha ao registrar ponto {punch_type} ({source}).", {"api": msg})
-        self._append_history(
-            punch_type=punch_type,
-            source=source,
-            success=False,
-            message=msg,
-        )
-        state["offline_queue"] = []
-        self.storage.save_runtime_state(state)
-        self.on_notify(f"Falha no registro ({punch_type}). Sem retry automático.")
-        return False, msg
+            state["offline_queue"] = []
+            self.storage.save_runtime_state(state)
+            self.on_notify(f"Falha no registro ({punch_type}). Sem retry automático.")
+            return False, msg
+        finally:
+            self._punch_lock.release()
 
     def manual_punch(
         self,
@@ -238,3 +283,105 @@ class SchedulerService:
 
     def _mark_last_successful_punch(self, state: dict, when: datetime) -> None:
         state["last_successful_punch_at"] = when.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join((value or "").strip().lower().split())
+
+    def _effective_reason_text(
+        self,
+        cfg: AppConfig,
+        punch_type: str,
+        custom_reason: str | None,
+    ) -> str:
+        custom = (custom_reason or "").strip()
+        if custom:
+            return custom
+        pt = (punch_type or "").strip().lower()
+        by_type_extra = (cfg.reason_by_punch_type or {}).get(pt)
+        if by_type_extra:
+            return by_type_extra
+        fallback = {
+            "entrada": cfg.reason_entrada,
+            "pausa": cfg.reason_pausa,
+            "retorno": cfg.reason_retorno,
+            "saida": cfg.reason_saida,
+        }
+        return fallback.get(pt, pt or "registro")
+
+    def _prune_successful_contents(self, state: dict, now: datetime) -> list[dict]:
+        day = now.strftime("%Y-%m-%d")
+        raw = state.get("successful_contents", [])
+        kept: list[dict] = []
+        if not isinstance(raw, list):
+            return kept
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            ts = str(item.get("timestamp", "") or "")
+            ptype = str(item.get("punch_type", "") or "")
+            reason = str(item.get("reason", "") or "")
+            if not ts or not ptype:
+                continue
+            if not ts.startswith(day):
+                continue
+            kept.append({"timestamp": ts, "punch_type": ptype, "reason": reason})
+        return kept
+
+    def _has_same_content_today(
+        self,
+        state: dict,
+        now: datetime,
+        punch_type: str,
+        reason: str,
+    ) -> bool:
+        day_items = self._prune_successful_contents(state, now)
+        state["successful_contents"] = day_items
+        ptype_norm = self._normalize_text(punch_type)
+        reason_norm = self._normalize_text(reason)
+        for item in day_items:
+            if (
+                self._normalize_text(item.get("punch_type", "")) == ptype_norm
+                and self._normalize_text(item.get("reason", "")) == reason_norm
+            ):
+                return True
+        return False
+
+    def _remember_successful_content(
+        self,
+        state: dict,
+        now: datetime,
+        punch_type: str,
+        reason: str,
+    ) -> None:
+        day_items = self._prune_successful_contents(state, now)
+        day_items.append(
+            {
+                "timestamp": now.isoformat(timespec="seconds"),
+                "punch_type": (punch_type or "").strip().lower(),
+                "reason": (reason or "").strip(),
+            }
+        )
+        state["successful_contents"] = day_items
+
+    def _has_successful_type_today(self, punch_type: str, now: datetime) -> bool:
+        today = now.strftime("%Y-%m-%d")
+        target = self._normalize_text(punch_type)
+        if not target:
+            return False
+        # Usa histórico persistido para cobrir reinício da aplicação no mesmo dia.
+        entries = self.storage.get_history(limit=max(300, int(self.storage.history_max_stored)))
+        for item in entries:
+            try:
+                ts = str(item.get("timestamp", "") or "")
+                if not ts.startswith(today):
+                    continue
+                status = self._normalize_text(str(item.get("status", "") or ""))
+                if status != "sucesso":
+                    continue
+                ptype = self._normalize_text(str(item.get("punch_type", "") or ""))
+                if ptype == target:
+                    return True
+            except Exception:
+                continue
+        return False

@@ -57,8 +57,10 @@ class AppController:
         set_startup(config.auto_start_windows)
         self.log("INFO", "Configuração salva.")
 
-    def save_profiles(self, profiles: list[ScheduleProfile]) -> None:
+    def save_profiles(self, profiles: list[ScheduleProfile], max_records_per_day: int | None = None) -> None:
         self.config.profiles = profiles
+        if max_records_per_day is not None:
+            self.config.max_records_per_day = max(1, int(max_records_per_day))
         self.storage.save_config(self.config)
         self.log("INFO", "Perfis de horários atualizados.")
 

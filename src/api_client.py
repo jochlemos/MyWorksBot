@@ -1,6 +1,7 @@
 import time
 
 from collections.abc import Callable
+from datetime import datetime
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -101,6 +102,22 @@ class MyworkApiClient:
                 self._ensure_on_punch_page(page, on_step)
                 reason_text = (custom_reason or "").strip() or self._reason_text_for_punch(punch_type)
                 self._step(on_step, "Verificando regras de descrição e histórico.")
+                max_per_day = max(1, int(getattr(self.config, "max_records_per_day", 4)))
+                today_count = self._count_today_history_records(page)
+                if today_count >= max_per_day:
+                    self._apply_post_run_pause(page, on_step)
+                    browser.close()
+                    return (
+                        False,
+                        f"Bloqueado: já existem {max_per_day} registros para hoje no histórico.",
+                    )
+                if self._has_same_punch_type_today(page, punch_type):
+                    self._apply_post_run_pause(page, on_step)
+                    browser.close()
+                    return (
+                        False,
+                        f"Bloqueado: já existe registro de {punch_type} hoje no histórico.",
+                    )
                 if self.config.prevent_same_description:
                     latest_comment = self._get_latest_history_comment(page)
                     if latest_comment and self._normalize_text(latest_comment) == self._normalize_text(
@@ -204,12 +221,23 @@ class MyworkApiClient:
 
     def _login_error_visible(self, page) -> bool:
         selectors = self.config.login_error_selectors
+        keywords = [
+            "credenciais inválidas",
+            "usuario ou senha incorretos",
+            "usuário ou senha incorretos",
+            "senha incorreta",
+            "dados inválidos",
+            "login inválido",
+            "falha no login",
+        ]
         for selector in selectors:
             for ctx in self._iter_contexts(page):
                 try:
                     loc = ctx.locator(selector).first
                     if loc.count() > 0 and loc.is_visible():
-                        return True
+                        txt = self._normalize_text(loc.inner_text() or "")
+                        if any(k in txt for k in keywords):
+                            return True
                 except Exception:
                     continue
         return False
@@ -255,7 +283,8 @@ class MyworkApiClient:
         deadline = time.monotonic() + timeout_ms / 1000.0
         pre = (pre_submit_url or "").strip()
         while time.monotonic() < deadline:
-            if self._login_error_visible(page):
+            # Considera erro de login apenas enquanto ainda estamos no formulário.
+            if self._still_on_login_form(page) and self._login_error_visible(page):
                 raise RuntimeError(
                     "Falha no login: mensagem de erro na tela ou credenciais inválidas."
                 )
@@ -277,17 +306,25 @@ class MyworkApiClient:
                 return
             if not self._still_on_login_form(page):
                 page.wait_for_timeout(trans)
-                if not self._still_on_login_form(page) and self._has_logged_in_ui(page):
-                    return
-                if not self._still_on_login_form(page) and self._is_punch_context(page):
+                if not self._still_on_login_form(page):
                     return
             page.wait_for_timeout(poll)
 
-        if self._login_error_visible(page):
+        if self._still_on_login_form(page) and self._login_error_visible(page):
             raise RuntimeError("Falha no login: verifique usuário e senha.")
         if self._has_logged_in_ui(page) or self._is_punch_context(page):
             return
         if self._still_on_login_form(page):
+            # Fallback para fluxos que mantêm /login por mais tempo: tenta abrir
+            # diretamente a página de ponto para validar sessão autenticada.
+            try:
+                probe_url = self._effective_punch_url()
+                if probe_url:
+                    page.goto(probe_url, wait_until="domcontentloaded", timeout=self._nav_timeout())
+                    if self._is_punch_context(page) or self._has_logged_in_ui(page):
+                        return
+            except Exception:
+                pass
             raise RuntimeError(
                 f"Login não foi concluído no tempo esperado (sessão não detectada). URL: {page.url}"
             )
@@ -479,44 +516,162 @@ class MyworkApiClient:
         elapsed = 0
         step = max(200, int(self.config.playwright_history_poll_step_ms))
         while elapsed < timeout_ms:
-            page.wait_for_timeout(step)
-            marker_after = self._get_history_marker(page)
+            try:
+                page.wait_for_timeout(step)
+                marker_after = self._get_history_marker(page)
+            except PlaywrightError as exc:
+                # Alguns fluxos fecham/recarregam a página logo após confirmar o ponto.
+                # Neste caso mantemos "sem confirmação" e deixamos o chamador decidir
+                # sem transformar automaticamente em falha dura.
+                text = self._normalize_text(str(exc))
+                if "target page" in text and "has been closed" in text:
+                    return False
+                raise
             if marker_after and marker_after != marker_before:
                 return True
             elapsed += step
         return False
 
+    def _count_today_history_records(self, page) -> int:
+        today_label = datetime.now().strftime("%d/%m/%Y")
+        count = 0
+        for ctx in self._iter_contexts(page):
+            try:
+                rows = ctx.locator("table tbody tr").all()
+            except Exception:
+                continue
+            for row in rows:
+                try:
+                    first_cell = row.locator("td").first
+                    if first_cell.count() == 0:
+                        continue
+                    text = (first_cell.inner_text() or "").strip()
+                    if today_label in text:
+                        count += 1
+                except Exception:
+                    continue
+        return count
+
+    def _has_same_punch_type_today(self, page, punch_type: str) -> bool:
+        today_label = datetime.now().strftime("%d/%m/%Y")
+        target = self._normalize_text(punch_type)
+        if not target:
+            return False
+        for ctx in self._iter_contexts(page):
+            try:
+                rows = ctx.locator("table tbody tr").all()
+            except Exception:
+                continue
+            for row in rows:
+                try:
+                    cells = row.locator("td").all()
+                    if not cells:
+                        continue
+                    first_text = (cells[0].inner_text() or "").strip()
+                    if today_label not in first_text:
+                        continue
+                    row_text = self._normalize_text(row.inner_text() or "")
+                    if target in row_text:
+                        return True
+                except Exception:
+                    continue
+        return False
+
     def _handle_reason_modal(self, page, punch_type: str, custom_reason: str | None = None) -> None:
         reason_text = (custom_reason or "").strip() or self._reason_text_for_punch(punch_type)
-        if not self._is_reason_modal_visible(page):
+        modal_contexts = self._visible_reason_modal_contexts(page)
+        if not modal_contexts:
             return
         fill_to = max(500, int(self.config.playwright_reason_modal_fill_timeout_ms))
         confirm_to = max(500, int(self.config.playwright_reason_modal_confirm_timeout_ms))
         after_to = max(0, int(self.config.playwright_reason_modal_after_click_ms))
-        try:
-            self._fill_first(
-                page,
-                self.config.reason_modal_fields,
-                reason_text,
-                timeout_ms=fill_to,
-                field_name="motivo",
-            )
-        except Exception:
-            pass
-
-        self._click_first(page, self.config.reason_modal_confirm_buttons, timeout_ms=confirm_to)
+        for modal in modal_contexts:
+            try:
+                self._fill_first_in_context(
+                    modal,
+                    self.config.reason_modal_fields,
+                    value=reason_text,
+                    timeout_ms=fill_to,
+                )
+            except Exception:
+                pass
+            if self._click_first_in_context(
+                modal,
+                self.config.reason_modal_confirm_buttons,
+                timeout_ms=confirm_to,
+            ):
+                break
         if after_to:
             page.wait_for_timeout(after_to)
 
     def _is_reason_modal_visible(self, page) -> bool:
+        return bool(self._visible_reason_modal_contexts(page))
+
+    def _visible_reason_modal_contexts(self, page) -> list:
+        contexts: list = []
+        # Prefer explicit dialog containers to avoid clicking unrelated submit buttons.
+        dialog_like = [".modal-dialog", "[role='dialog']", ".modal"]
+        for selector in dialog_like:
+            for ctx in self._iter_contexts(page):
+                try:
+                    loc = ctx.locator(selector).all()
+                    for item in loc:
+                        try:
+                            if item.is_visible():
+                                contexts.append(item)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        if contexts:
+            return contexts
+
+        # Fallback to configured indicators when dialog containers are not available.
         for selector in self.config.reason_modal_indicators:
             for ctx in self._iter_contexts(page):
                 try:
-                    locator = ctx.locator(selector).first
-                    if locator.count() and locator.is_visible():
-                        return True
+                    loc = ctx.locator(selector).first
+                    if loc.count() and loc.is_visible():
+                        contexts.append(loc)
                 except Exception:
                     continue
+        return contexts
+
+    def _fill_first_in_context(self, context, selectors: list[str], value: str, timeout_ms: int) -> bool:
+        for selector in self._unique_selectors(selectors):
+            try:
+                field = context.locator(selector).first
+                if field.count() == 0:
+                    continue
+                field.scroll_into_view_if_needed(timeout=timeout_ms)
+                try:
+                    field.fill(value, timeout=timeout_ms)
+                except Exception:
+                    field.click(timeout=timeout_ms)
+                    field.evaluate(
+                        """(el, v) => {
+                            el.value = v;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        value,
+                    )
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _click_first_in_context(self, context, selectors: list[str], timeout_ms: int) -> bool:
+        for selector in self._unique_selectors(selectors):
+            try:
+                button = context.locator(selector).first
+                if button.count() == 0:
+                    continue
+                button.scroll_into_view_if_needed(timeout=timeout_ms)
+                button.click(timeout=timeout_ms)
+                return True
+            except Exception:
+                continue
         return False
 
     def _has_visible_error_feedback(self, page) -> bool:

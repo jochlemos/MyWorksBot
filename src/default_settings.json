@@ -22,6 +22,7 @@
   "browser_pause_max_seconds": 120,
   "punch_types": ["entrada", "pausa", "retorno", "saida"],
   "scheduler_poll_interval_seconds": 20,
+  "max_records_per_day": 4,
   "duplicate_guard_seconds": 90,
   "auto_failure_cooldown_minutes": 3,
   "retry_cooldown_minutes": 5,

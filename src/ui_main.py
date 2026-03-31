@@ -219,6 +219,12 @@ class MainWindow(QMainWindow):
             self.weekday_checks.append(chk)
             weekdays_row.addWidget(chk)
         weekdays_row.addStretch()
+        self.max_records_per_day_spin = QSpinBox()
+        self.max_records_per_day_spin.setRange(1, 20)
+        self.max_records_per_day_spin.setValue(4)
+        self.max_records_per_day_spin.setToolTip(
+            "Quantidade máxima de registros permitidos por dia no Mywork."
+        )
 
         self.event_time_input = QLineEdit()
         self.event_time_input.setPlaceholderText("HH:MM")
@@ -287,7 +293,10 @@ class MainWindow(QMainWindow):
         if sel is not None:
             sel.selectionChanged.connect(self._on_schedule_table_selection_changed)
 
-        test_schedule_btn = QPushButton("Teste de registro")
+        test_schedule_btn = QPushButton("Teste de registro (real)")
+        test_schedule_btn.setToolTip(
+            "Executa um registro real no Mywork usando o tipo selecionado."
+        )
         test_schedule_btn.clicked.connect(self._test_schedule_punch)
         save = QPushButton("Salvar agendamentos")
         save.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -302,6 +311,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(profile_row)
         layout.addWidget(QLabel("Dias da semana:"))
         layout.addLayout(weekdays_row)
+        max_row = QHBoxLayout()
+        max_row.setSpacing(8)
+        max_row.addWidget(QLabel("Máximo de registros por dia:"))
+        max_row.addWidget(self.max_records_per_day_spin, 0, Qt.AlignmentFlag.AlignLeft)
+        max_row.addStretch()
+        layout.addLayout(max_row)
         layout.addLayout(event_row)
         layout.addWidget(
             QLabel(
@@ -363,6 +378,7 @@ class MainWindow(QMainWindow):
         self.browser_pause_spin.setRange(0, max(0, int(cfg.browser_pause_max_seconds)))
         self.browser_pause_spin.setValue(cfg.browser_pause_seconds)
         self.browser_pause_spin.setEnabled(not cfg.headless_browser)
+        self.max_records_per_day_spin.setValue(max(1, int(cfg.max_records_per_day)))
         self.event_type_combo.clear()
         self.event_type_combo.addItems(list(cfg.punch_types) if cfg.punch_types else [])
         self.status_label.setText(f"Status: {self.controller.get_status_text()}")
@@ -542,7 +558,10 @@ class MainWindow(QMainWindow):
                     events=events,
                 )
             ]
-            self.controller.save_profiles(profiles)
+            self.controller.save_profiles(
+                profiles,
+                max_records_per_day=self.max_records_per_day_spin.value(),
+            )
             QMessageBox.information(self, "Agendamentos", "Agendamentos salvos.")
             self._load_schedule_ui_from_profiles(profiles)
         except Exception as exc:  # noqa: BLE001
@@ -844,6 +863,20 @@ class MainWindow(QMainWindow):
         punch_type = self.event_type_combo.currentText().strip() or "entrada"
         desc = self.event_description_input.text().strip()
         reason = desc or f"teste {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+        answer = QMessageBox.question(
+            self,
+            "Teste de registro",
+            (
+                "Este teste executa um REGISTRO REAL no Mywork.\n\n"
+                f"Tipo: {punch_type}\n"
+                f"Descrição: {reason}\n\n"
+                "Deseja continuar?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
 
         def task() -> tuple[bool, str]:
             return self.controller.manual_punch(
