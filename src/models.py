@@ -61,6 +61,8 @@ class AppConfig:
     tolerance_minutes: int = 5
     auto_start_windows: bool = False
     headless_browser: bool = False
+    enable_notification_sounds: bool = True
+    collapsed_ui_scale: str = "medio"
     browser_pause_seconds: int = 15
     browser_pause_max_seconds: int = 120
     punch_types: list[str] = field(default_factory=list)
@@ -154,6 +156,8 @@ def app_config_from_merged_dict(raw: dict[str, Any]) -> AppConfig:
         tolerance_minutes=int(raw.get("tolerance_minutes", 5)),
         auto_start_windows=bool(raw.get("auto_start_windows", False)),
         headless_browser=bool(raw.get("headless_browser", False)),
+        enable_notification_sounds=bool(raw.get("enable_notification_sounds", True)),
+        collapsed_ui_scale=str(raw.get("collapsed_ui_scale", "medio") or "medio"),
         browser_pause_seconds=int(raw.get("browser_pause_seconds", 15)),
         browser_pause_max_seconds=int(raw.get("browser_pause_max_seconds", 120)),
         punch_types=_str_list("punch_types"),

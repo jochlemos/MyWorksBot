@@ -2,9 +2,13 @@ import threading
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
+try:
+    import winsound
+except Exception:  # noqa: BLE001
+    winsound = None
 
 from PySide6.QtGui import QAction, QIcon, QTextCursor
-from PySide6.QtCore import QMetaObject, Qt, QTimer, Slot
+from PySide6.QtCore import QMetaObject, Qt, QTimer, QSize, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -48,10 +53,13 @@ class MainWindow(QMainWindow):
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1000)
         self._clock_timer.timeout.connect(self._refresh_home_panel)
+        self._details_visible = True
+        self._expanded_window_size: QSize | None = None
         self.setWindowTitle("Mywork Ponto Bot")
         self.resize(900, 620)
         self._setup_ui()
         self._setup_tray()
+        self._toggle_details_visibility()
         self.refresh_all()
         self._clock_timer.start()
 
@@ -66,12 +74,14 @@ class MainWindow(QMainWindow):
         home_grid.setContentsMargins(0, 0, 0, 0)
         home_grid.setHorizontalSpacing(18)
         home_grid.setVerticalSpacing(2)
-        home_grid.setColumnStretch(0, 1)
-        home_grid.setColumnMinimumWidth(1, 280)
+        home_grid.setColumnStretch(0, 5)
+        home_grid.setColumnStretch(1, 1)
+        home_grid.setColumnMinimumWidth(1, 170)
+        home_grid.setRowStretch(2, 1)
 
-        left_title = QLabel("Próximos agendamentos:")
-        left_title.setStyleSheet("font-weight: 600;")
-        left_title.setContentsMargins(0, 0, 0, 0)
+        self.left_title = QLabel("Próximos agendamentos:")
+        self.left_title.setStyleSheet("font-weight: 600;")
+        self.left_title.setContentsMargins(0, 0, 0, 0)
 
         self.next_schedules_label = QLabel("Carregando...")
         self.next_schedules_label.setWordWrap(True)
@@ -80,26 +90,33 @@ class MainWindow(QMainWindow):
 
         self.clock_label = QLabel("--:--")
         self.clock_label.setStyleSheet("font-size: 96px; font-weight: 700;")
-        self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.clock_label.setContentsMargins(0, 0, 0, 0)
+        self.toggle_details_btn = QPushButton("▴")
+        self.toggle_details_btn.setFixedWidth(40)
+        self.toggle_details_btn.setToolTip("Ocultar/mostrar campos abaixo.")
+        self.toggle_details_btn.clicked.connect(self._toggle_details_visibility)
 
-        home_grid.addWidget(
-            left_title,
-            0,
-            0,
-            alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+        left_panel = QWidget()
+        left_panel_layout = QVBoxLayout(left_panel)
+        left_panel_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel_layout.setSpacing(8)
+        left_panel_layout.addWidget(self.left_title, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        left_panel_layout.addWidget(
+            self.next_schedules_label, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
         )
-        home_grid.addWidget(
-            self.next_schedules_label,
-            1,
-            0,
-            alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
-        )
+        home_grid.addWidget(left_panel, 0, 0, 2, 1)
         home_grid.addWidget(
             self.clock_label,
             0,
             1,
-            2,
+            1,
+            1,
+            alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+        )
+        home_grid.addWidget(
+            self.toggle_details_btn,
+            1,
             1,
             alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
         )
@@ -107,7 +124,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(home_grid)
 
         self.status_label = QLabel("Status: -")
-        layout.addWidget(self.status_label)
+        self.status_row_widget = QWidget()
+        status_row = QHBoxLayout(self.status_row_widget)
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+        status_row.addWidget(self.status_label, 1)
+        self.minimize_btn = QPushButton("Minimizar")
+        self.minimize_btn.setToolTip("Oculta a janela e mantém o aplicativo em execução na bandeja.")
+        self.minimize_btn.clicked.connect(self._minimize_to_tray)
+        status_row.addWidget(self.minimize_btn, 0)
+        layout.addWidget(self.status_row_widget)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_config_tab(), "Configuração")
@@ -119,7 +145,11 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(QIcon())
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self.setWindowIcon(icon)
+        self.tray.setIcon(icon)
         self.tray.setToolTip("Mywork Ponto Bot")
         menu = QMenu()
         show_action = QAction("Abrir", self)
@@ -149,6 +179,15 @@ class MainWindow(QMainWindow):
         self.tolerance_input.setRange(0, 20)
         self.startup_check = QCheckBox("Iniciar com Windows")
         self.headless_check = QCheckBox("Ocultar janela do navegador (headless)")
+        self.notification_sounds_check = QCheckBox("Tocar sons de notificação")
+        self.collapsed_scale_combo = QComboBox()
+        self.collapsed_scale_combo.addItem("Pequeno", "pequeno")
+        self.collapsed_scale_combo.addItem("Médio", "medio")
+        self.collapsed_scale_combo.addItem("Grande", "grande")
+        self.collapsed_scale_combo.setToolTip(
+            "Define o tamanho visual no modo recolhido (relógio + listagem)."
+        )
+        self.collapsed_scale_combo.currentIndexChanged.connect(self._on_collapsed_scale_changed)
         self.browser_pause_spin = QSpinBox()
         self.browser_pause_spin.setRange(0, 120)
         self.browser_pause_spin.setSuffix(" s")
@@ -162,6 +201,8 @@ class MainWindow(QMainWindow):
         save_btn.clicked.connect(self._save_config)
         test_btn = QPushButton("Testar login robô")
         test_btn.clicked.connect(self._test_connection)
+        test_sound_btn = QPushButton("Testar som")
+        test_sound_btn.clicked.connect(self._test_notification_sound)
 
         form.addRow("E-mail:", self.email_input)
         form.addRow("Senha:", self.password_input)
@@ -175,11 +216,15 @@ class MainWindow(QMainWindow):
         form.addRow("Tolerância (min):", self.tolerance_input)
         form.addRow("", self.startup_check)
         form.addRow("", self.headless_check)
+        form.addRow("", self.notification_sounds_check)
+        form.addRow("Tamanho visual (modo recolhido):", self.collapsed_scale_combo)
         form.addRow("Pausa com janela visível antes de fechar:", self.browser_pause_spin)
         footer_btns = QWidget()
         footer_layout = QHBoxLayout(footer_btns)
         footer_layout.setContentsMargins(0, 12, 0, 0)
         footer_layout.addStretch()
+        footer_layout.addWidget(test_sound_btn)
+        footer_layout.addSpacing(10)
         footer_layout.addWidget(test_btn)
         footer_layout.addSpacing(10)
         footer_layout.addWidget(save_btn)
@@ -375,6 +420,10 @@ class MainWindow(QMainWindow):
         self.tolerance_input.setValue(cfg.tolerance_minutes)
         self.startup_check.setChecked(cfg.auto_start_windows)
         self.headless_check.setChecked(cfg.headless_browser)
+        self.notification_sounds_check.setChecked(bool(getattr(cfg, "enable_notification_sounds", True)))
+        self._set_collapsed_scale_combo_value(
+            str(getattr(cfg, "collapsed_ui_scale", "medio") or "medio")
+        )
         self.browser_pause_spin.setRange(0, max(0, int(cfg.browser_pause_max_seconds)))
         self.browser_pause_spin.setValue(cfg.browser_pause_seconds)
         self.browser_pause_spin.setEnabled(not cfg.headless_browser)
@@ -416,6 +465,27 @@ class MainWindow(QMainWindow):
     def notify(self, text: str) -> None:
         self.tray.showMessage("Mywork Ponto Bot", text, QSystemTrayIcon.MessageIcon.Information, 4000)
         self.status_label.setText(f"Status: {text}")
+        self._play_notification_sound(text)
+
+    def _play_notification_sound(self, text: str) -> None:
+        normalized = (text or "").strip().lower()
+        is_error = any(k in normalized for k in ["falha", "erro", "bloqueado"])
+        is_success = "sucesso" in normalized
+        if not bool(getattr(self.controller.config, "enable_notification_sounds", True)):
+            return
+        if winsound is None:
+            QApplication.beep()
+            return
+        try:
+            if is_error:
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+                return
+            if is_success:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                return
+            winsound.MessageBeep(winsound.MB_OK)
+        except Exception:  # noqa: BLE001
+            QApplication.beep()
 
     def _run_async_robot(
         self,
@@ -530,6 +600,8 @@ class MainWindow(QMainWindow):
             tolerance_minutes=self.tolerance_input.value(),
             auto_start_windows=self.startup_check.isChecked(),
             headless_browser=self.headless_check.isChecked(),
+            enable_notification_sounds=self.notification_sounds_check.isChecked(),
+            collapsed_ui_scale=self._selected_collapsed_scale_key(),
             browser_pause_seconds=self.browser_pause_spin.value(),
             profiles=self.controller.get_current_profiles(),
         )
@@ -822,9 +894,10 @@ class MainWindow(QMainWindow):
         next_items = candidates[:n]
         lines = []
         for dt, punch_type, profile_name, weekday, desc in next_items:
-            base = f"- {dt.strftime('%d/%m %H:%M')} ({weekday}) - {punch_type} [{profile_name}]"
+            # Formato curto para reduzir quebra de linha, em qualquer modo.
+            base = f"- {dt.strftime('%d/%m %H:%M')} {punch_type}"
             if desc:
-                base = f"{base} — {desc}"
+                base = f"{base} ({desc})"
             lines.append(base)
         return "\n".join(lines)
 
@@ -842,6 +915,8 @@ class MainWindow(QMainWindow):
             tolerance_minutes=self.tolerance_input.value(),
             auto_start_windows=self.startup_check.isChecked(),
             headless_browser=self.headless_check.isChecked(),
+            enable_notification_sounds=self.notification_sounds_check.isChecked(),
+            collapsed_ui_scale=self._selected_collapsed_scale_key(),
             browser_pause_seconds=self.browser_pause_spin.value(),
             profiles=self.controller.get_current_profiles(),
         )
@@ -858,6 +933,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Teste robô", msg if ok else f"Falhou: {msg}")
 
         self._run_async_robot(task, done)
+
+    def _test_notification_sound(self) -> None:
+        if not self.notification_sounds_check.isChecked():
+            QMessageBox.information(
+                self,
+                "Som de notificação",
+                "Ative a opção 'Tocar sons de notificação' para testar.",
+            )
+            return
+        self._play_notification_sound("sucesso")
+        QTimer.singleShot(250, lambda: self._play_notification_sound("erro"))
 
     def _test_schedule_punch(self) -> None:
         punch_type = self.event_type_combo.currentText().strip() or "entrada"
@@ -923,7 +1009,78 @@ class MainWindow(QMainWindow):
             self.showNormal()
             self.activateWindow()
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def _selected_collapsed_scale_key(self) -> str:
+        current = self.collapsed_scale_combo.currentData()
+        return str(current or "medio")
+
+    def _set_collapsed_scale_combo_value(self, value: str) -> None:
+        key = (value or "medio").strip().lower()
+        idx = self.collapsed_scale_combo.findData(key)
+        if idx < 0:
+            idx = self.collapsed_scale_combo.findData("medio")
+        self.collapsed_scale_combo.setCurrentIndex(max(0, idx))
+
+    def _collapsed_scale_fonts(self) -> tuple[int, int]:
+        key = self._selected_collapsed_scale_key()
+        if key == "pequeno":
+            return 104, 24
+        if key == "grande":
+            return 132, 32
+        return 118, 28
+
+    def _collapsed_scale_window_size(self) -> tuple[int, int, int]:
+        key = self._selected_collapsed_scale_key()
+        if key == "pequeno":
+            return 820, 980, 210
+        if key == "grande":
+            return 980, 1160, 250
+        return 920, 1080, 230
+
+    def _on_collapsed_scale_changed(self, _idx: int) -> None:
+        if not self._details_visible:
+            clock_px, list_px = self._collapsed_scale_fonts()
+            self.clock_label.setStyleSheet(f"font-size: {clock_px}px; font-weight: 700;")
+            self.next_schedules_label.setStyleSheet(f"font-size: {list_px}px;")
+            min_w, max_w, h = self._collapsed_scale_window_size()
+            compact_width = min(max(min_w, self.width()), max_w)
+            self.resize(compact_width, h)
+            self._refresh_home_panel()
+
+    def _minimize_to_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.showMinimized()
+            return
         self.hide()
-        self.notify("Aplicativo rodando em background.")
-        event.ignore()
+        self.notify("Aplicativo minimizado para a bandeja. Use o ícone na bandeja para reabrir.")
+
+    def _toggle_details_visibility(self) -> None:
+        self._details_visible = not self._details_visible
+        self.status_row_widget.setVisible(self._details_visible)
+        if self.main_tabs is not None:
+            self.main_tabs.setVisible(self._details_visible)
+        if self._details_visible:
+            self.clock_label.setStyleSheet("font-size: 96px; font-weight: 700;")
+            self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.left_title.setStyleSheet("font-weight: 600;")
+            self.next_schedules_label.setStyleSheet("")
+            self.toggle_details_btn.setText("▴")
+            if self._expanded_window_size is not None:
+                self.resize(self._expanded_window_size)
+        else:
+            self._expanded_window_size = self.size()
+            clock_px, list_px = self._collapsed_scale_fonts()
+            min_w, max_w, h = self._collapsed_scale_window_size()
+            self.clock_label.setStyleSheet(f"font-size: {clock_px}px; font-weight: 700;")
+            self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            self.left_title.setStyleSheet("font-weight: 700; font-size: 14px;")
+            self.next_schedules_label.setStyleSheet(f"font-size: {list_px}px;")
+            self.toggle_details_btn.setText("▾")
+            if self.isMaximized():
+                self.showNormal()
+            compact_width = min(max(min_w, self.width()), max_w)
+            self.resize(compact_width, h)
+        self._refresh_home_panel()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.controller.quit_app()
+        event.accept()

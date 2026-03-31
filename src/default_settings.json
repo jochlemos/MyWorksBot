@@ -18,6 +18,8 @@
   "tolerance_minutes": 5,
   "auto_start_windows": false,
   "headless_browser": false,
+  "enable_notification_sounds": true,
+  "collapsed_ui_scale": "medio",
   "browser_pause_seconds": 15,
   "browser_pause_max_seconds": 120,
   "punch_types": ["entrada", "pausa", "retorno", "saida"],
