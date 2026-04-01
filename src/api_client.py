@@ -860,14 +860,24 @@ class MyworkApiClient:
         )
         pt = (punch_type or "").lower()
         extra = self.config.punch_selectors_by_type.get(pt, [])
-        # Prioriza seletores específicos do tipo (pausa/retorno/etc.) para evitar
-        # cliques em links/botões genéricos de "Bater ponto" que apenas navegam.
+        # Prioriza seletores específicos do tipo para evitar cliques em elementos
+        # genéricos de navegação que não confirmam o registro de ponto.
         merged = [*extra, *base]
-        if pt and pt != "entrada":
-            # Para tipos diferentes de entrada, evita fallback em links genéricos
-            # que só navegam para a tela (sem acionar registro real).
-            merged = [s for s in merged if not s.strip().lower().startswith("a:has-text(")]
-        return self._unique_selectors(merged)
+        cleaned: list[str] = []
+        for selector in merged:
+            lower = selector.strip().lower()
+            # Links genéricos de "bater/registrar/marcar ponto" costumam apenas
+            # abrir/alternar área e podem gerar falso positivo de clique.
+            if lower.startswith("a:has-text(") and any(
+                text in lower for text in ("bater ponto", "registrar ponto", "marcar ponto")
+            ):
+                continue
+            cleaned.append(selector)
+
+        # Mantém anchors específicos como último fallback.
+        non_anchor = [s for s in cleaned if not s.strip().lower().startswith("a:")]
+        anchors = [s for s in cleaned if s.strip().lower().startswith("a:")]
+        return self._unique_selectors([*non_anchor, *anchors])
 
     def _try_open_punch_area(self, page) -> None:
         menu_to = max(500, int(self.config.playwright_menu_click_timeout_ms))
