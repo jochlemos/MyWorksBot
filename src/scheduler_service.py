@@ -115,16 +115,31 @@ class SchedulerService:
         executions = state.get("executions", {})
         failed_attempts = state.get("failed_attempts", {})
         pending_confirmations = state.get("pending_confirmations", {})
+        confirmed_events = state.get("confirmed_schedule_events", {})
         today_key = now.strftime("%Y-%m-%d")
         tolerance = max(0, int(cfg.tolerance_minutes))
 
-        pending_confirmations = self._process_pending_confirmations(pending_confirmations, now, today_key)
+        pending_confirmations, confirmed_events = self._process_pending_confirmations(
+            pending_confirmations, confirmed_events, now, today_key
+        )
 
         for profile in cfg.profiles:
             if not profile.enabled or weekday not in profile.weekdays:
                 continue
             for ev in profile.events:
                 key = f"{today_key}|{profile.name}|{ev.punch_type}|{ev.time}"
+                if confirmed_events.get(key):
+                    self.on_log(
+                        "INFO",
+                        "Agendamento já confirmado anteriormente; ignorando nova verificação/tentativa.",
+                        {
+                            "punch_type": ev.punch_type,
+                            "profile": profile.name,
+                            "event_time": ev.time,
+                            "rule": "confirmed_schedule_event_skip",
+                        },
+                    )
+                    continue
                 if executions.get(key):
                     continue
                 failed_at = failed_attempts.get(key)
@@ -185,6 +200,9 @@ class SchedulerService:
         }
         latest_state["pending_confirmations"] = {
             k: v for k, v in pending_confirmations.items() if k.startswith(today_key)
+        }
+        latest_state["confirmed_schedule_events"] = {
+            k: v for k, v in confirmed_events.items() if k.startswith(today_key)
         }
         self.storage.save_runtime_state(latest_state)
 
@@ -343,17 +361,30 @@ class SchedulerService:
     def _process_pending_confirmations(
         self,
         pending_confirmations: dict,
+        confirmed_events: dict,
         now: datetime,
         today_key: str,
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         if not isinstance(pending_confirmations, dict):
-            return {}
+            pending_confirmations = {}
+        if not isinstance(confirmed_events, dict):
+            confirmed_events = {}
         client: MyworkApiClient = self.get_api_client()
         if not client.is_configured():
-            return pending_confirmations
+            return pending_confirmations, confirmed_events
         next_state: dict = {}
+        next_confirmed: dict = {
+            k: v for k, v in confirmed_events.items() if str(k).startswith(today_key)
+        }
         for key, item in pending_confirmations.items():
             if not str(key).startswith(today_key):
+                continue
+            if next_confirmed.get(key):
+                self.on_log(
+                    "INFO",
+                    "Pendência já confirmada anteriormente; ignorando rechecagem tardia.",
+                    {"key": key, "rule": "confirmed_schedule_event_skip"},
+                )
                 continue
             if not isinstance(item, dict):
                 continue
@@ -388,6 +419,7 @@ class SchedulerService:
                     success=True,
                     message=msg,
                 )
+                next_confirmed[key] = now.isoformat(timespec="seconds")
             else:
                 self.on_log(
                     "WARN",
@@ -400,7 +432,7 @@ class SchedulerService:
                     success=False,
                     message=msg,
                 )
-        return next_state
+        return next_state, next_confirmed
 
     def _prune_successful_contents(self, state: dict, now: datetime) -> list[dict]:
         day = now.strftime("%Y-%m-%d")
